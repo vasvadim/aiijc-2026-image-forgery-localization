@@ -83,9 +83,9 @@ AIC = 2 · Dice_pos · (1 − FPR_neg) / ( Dice_pos + (1 − FPR_neg) )
 
 | Файл | Размер | Назначение |
 |---|---|---|
-| `train_stage1.zip` | 39.05 GB | обучающая выборка с GT-масками |
-| `test_stage1.zip` | 0.59 GB | тест, 2160 изображений |
-| `nanobanana.zip` | 16.86 GB | доп. данные без масок (~20 000 пар оригинал/правка + prompt) |
+| `train_stage1.zip` | 39.05 GB | обучающая выборка с GT-масками — **103 699 строк** в train.csv |
+| `test_stage1.zip` | 0.59 GB | тест — **2 160 изображений** |
+| `nanobanana.zip` | 16.86 GB | доп. данные без масок — **19 952 пары** оригинал/правка + prompt |
 | `code.zip` | 5 KB | бейзлайн (скопирован в `reference/baseline/`) |
 | `submission.zip` | 3 MB | пример сабмита (csv скопирован в `reference/submission_example/`) |
 
@@ -102,8 +102,13 @@ stage1/train/src/         # оригиналы (опционально, есть
 - `chng_img_path` — путь к изменённому изображению;
 - `gt_path` — путь к GT-маске.
 - Пути в CSV **относительные от корня распаковки** (DATA_DIR).
-- Неизвестно до распаковки: есть ли в train негативные примеры (пустые маски), распределение
-  размеров, типов манипуляций. **Первое, что нужно сделать после скачивания — EDA (см. §8).**
+- Имена файлов несут информацию о генераторе, например
+  `..._coco_000000059319_powerpaint_realisticvision_1_Blended.jpg`,
+  `..._inpaintanything_2_sd2_2_None.jpg` — т.е. базовые картинки из COCO, правки сделаны
+  PowerPaint / InpaintAnything / SD2 и др., бывают цепочки из нескольких правок. Это надо
+  распарсить в EDA (тип генератора как признак для стратификации валидации).
+- Неизвестно до EDA: есть ли в train негативные примеры (пустые маски), распределение размеров,
+  площадей масок. **Первое, что нужно сделать — EDA (см. §9).**
 
 ### 3.2 test_stage1.zip
 ```
@@ -219,20 +224,34 @@ PNG, одноканальный (`L`), значения только `0` / `255`
 - Глобальный `/opt/miniconda3` (conda 26.7), системный Python 3.12, Docker есть (без sudo — скорее всего недоступен), tmux/screen/setfacl/unzip/git есть.
 - Сеть: скачивание с HF ~4 MB/s в один поток, с российских зеркал ~10 MB/s. 56 GB ≈ 2–4 ч.
 
-### 7.2 Рабочее место на кластере (создано 01.09.2026)
+### 7.2 Рабочее место на кластере (готово 02.09.2026)
+**Статус: датасет скачан и распакован, окружение собрано, kernel зарегистрирован, репо склонирован.**
 ```
 /home/vasilenkova/               # chmod 711 — напарник может «проходить» внутрь
 └── aic2026/                     # chmod 755
     ├── data/raw/                # сюда качаются zip с HF (chmod 755)
-    ├── data/                    # сюда же распаковывать: stage1/, test_stage1/, nanobanana/
-    ├── code/                    # общий код (chmod 775)
-    ├── logs/                    # логи скачивания/обучения
-    ├── envs/dl/                 # venv: huggingface_hub[hf_xet] (для скачивания)
+    ├── data/stage1/             # 37 GB: train.csv, train/{img,mask,src}
+    ├── data/test_stage1/        # 572 MB: test.csv, test_stage1_img/, submission.csv
+    ├── data/nanobanana/         # 16 GB: pico_nanobanana.csv, pico_nanobanana/{img,src}
+    ├── code/                    # клон git-репозитория (remote git@github.com:vasvadim/aiijc_second_stage.git)
+    ├── envs/train/              # ОБЩЕЕ conda-окружение (см. ниже)
+    ├── envs/dl/                 # venv только для скачивания (huggingface_hub[hf_xet])
+    ├── runs/<логин>/            # запуски экспериментов
+    ├── logs/                    # download.log, setup_env.log, unpack.out
     ├── .hf_cache/               # HF_HOME
-    └── download.sh              # скрипт скачивания (nohup, лог в logs/download.log)
+    └── download.sh              # скрипт скачивания (уже отработал, DOWNLOAD_EXIT=0)
 ```
-Скачивание: `hf download QwertyNice/Digital_Detective_AIC2026 --repo-type dataset --local-dir ~/aic2026/data/raw`
-c `HF_XET_HIGH_PERFORMANCE=1`. Проверка прогресса: `tail -f ~/aic2026/logs/download.log`, `du -sh ~/aic2026/data/raw/*`.
+Окружение `envs/train` (conda-forge, Python 3.11): **torch 2.13.0+cu126** (CUDA видна, 8 GPU),
+torchvision 0.28, segmentation-models-pytorch 0.5.0, timm 1.0.29, albumentations 2.0.8,
+opencv 5.0, numpy 2.4, pandas 3.0, scikit-learn 1.9, fvcore, huggingface_hub. Jupyter-kernel: `aic2026`.
+Активация: `source /opt/miniconda3/etc/profile.d/conda.sh && conda activate /home/vasilenkova/aic2026/envs/train`.
+Пересборка: `bash scripts/setup_env.sh` (использует только conda-forge — Anaconda-каналы требуют
+принятия ToS и падают в неинтерактивном режиме).
+Локальный SSH-алиас: `ssh aic` (ключ, agent forwarding для git на кластере).
+**SSH к кластеру нестабилен**: TCP-таймауты на порт 22, успешна ~1 попытка из 3–5 — оборачивать
+в цикл ретраев, долгие задачи запускать через nohup/tmux.
+Скачивание было сделано так: `hf download QwertyNice/Digital_Detective_AIC2026 --repo-type dataset --local-dir ~/aic2026/data/raw`
+c `HF_XET_HIGH_PERFORMANCE=1` (~4 MB/s, около 1.5 ч). Размеры архивов проверены скриптом `scripts/unpack_data.sh`.
 
 **Доступ напарника.** Чтение уже открыто всем (755). Для записи в общие папки, когда известен
 логин напарника `<user>`:
