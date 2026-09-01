@@ -2,32 +2,33 @@
 # Выгружает на локальную машину маленькую отладочную выборку: test_stage1 целиком + N случайных
 # train-примеров (img+mask+src если есть) с урезанным train.csv. Локально: ./data (в .gitignore).
 # Запускать локально (Git Bash), нужен алиас `aic` в ~/.ssh/config:  bash scripts/fetch_debug_sample.sh 200
+# Без rsync (в Git Bash его нет) — упаковываем на кластере в tar и тянем одним потоком.
 set -euo pipefail
 N=${1:-200}
 REMOTE=/home/vasilenkova/aic2026/data
-LOCAL="$(dirname "$0")/../data"
+LOCAL="$(cd "$(dirname "$0")/.." && pwd)/data"
 mkdir -p "$LOCAL"
 
-echo ">> test_stage1"
-rsync -a --info=progress2 aic:"$REMOTE/test_stage1/" "$LOCAL/test_stage1/"
-
-echo ">> $N train-примеров"
+echo ">> формирую выборку на кластере ($N train-примеров + test_stage1)"
 ssh aic "cd $REMOTE && python3 - <<'EOF'
-import csv, random, os
+import csv, random, os, tarfile
 random.seed(42)
 rows = list(csv.DictReader(open('stage1/train.csv', encoding='utf-8')))
 sample = random.sample(rows, min($N, len(rows)))
-os.makedirs('/tmp/aic_sample', exist_ok=True)
-with open('/tmp/aic_sample/train.csv', 'w', newline='', encoding='utf-8') as f:
+os.makedirs('/tmp/aic_sample/stage1', exist_ok=True)
+with open('/tmp/aic_sample/stage1/train.csv', 'w', newline='', encoding='utf-8') as f:
     w = csv.DictWriter(f, fieldnames=rows[0].keys()); w.writeheader(); w.writerows(sample)
-with open('/tmp/aic_sample/files.txt', 'w') as f:
+with tarfile.open('/tmp/aic_sample/sample.tar', 'w') as t:
+    t.add('/tmp/aic_sample/stage1/train.csv', arcname='stage1/train.csv')
+    t.add('test_stage1', arcname='test_stage1')
     for r in sample:
         for k in ('orgl_img_path', 'chng_img_path', 'gt_path'):
-            if r.get(k): f.write(r[k].strip().replace('\\\\', '/') + '\n')
-print('ok', len(sample))
+            p = (r.get(k) or '').strip().replace('\\\\', '/')
+            if p and os.path.exists(p): t.add(p, arcname=p)
+print('ok', len(sample), os.path.getsize('/tmp/aic_sample/sample.tar') // 2**20, 'MiB')
 EOF"
-mkdir -p "$LOCAL/stage1"
-rsync -a --info=progress2 --files-from=<(ssh aic cat /tmp/aic_sample/files.txt) aic:"$REMOTE/" "$LOCAL/"
-scp -q aic:/tmp/aic_sample/train.csv "$LOCAL/stage1/train.csv"
+echo ">> скачиваю"
+ssh aic "cat /tmp/aic_sample/sample.tar" | tar xf - -C "$LOCAL"
+ssh aic "rm -rf /tmp/aic_sample"
 echo ">> готово: $LOCAL"
 du -sh "$LOCAL"/*
