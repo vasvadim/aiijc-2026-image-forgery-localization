@@ -1,0 +1,35 @@
+# data / artifacts never go to git
+data/
+runs/
+checkpoints/
+predictions/
+*.pth
+*.pt
+*.ckpt
+*.zip
+*.npy
+*.npz
+submission*/
+!reference/submission_example/
+
+# envs
+envs/
+.venv/
+venv/
+.hf_cache/
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+
+# logs / misc
+logs/
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.secret
+.env
