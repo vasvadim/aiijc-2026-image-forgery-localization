@@ -7,7 +7,7 @@ source /opt/miniconda3/etc/profile.d/conda.sh
 
 if [ ! -d "$ENV_DIR" ]; then
   echo ">> создаю окружение $ENV_DIR"
-  conda create -y -p "$ENV_DIR" python=3.11
+  conda create -y -p "$ENV_DIR" --override-channels -c conda-forge python=3.11
 fi
 conda activate "$ENV_DIR"
 python -m pip install -U pip
