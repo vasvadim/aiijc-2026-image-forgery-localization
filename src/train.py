@@ -357,7 +357,15 @@ def main():
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         if scheduler and ckpt.get('scheduler'):
-            scheduler.load_state_dict(ckpt['scheduler'])
+            if ckpt.get('args', {}).get('epochs') == args.epochs:
+                scheduler.load_state_dict(ckpt['scheduler'])
+            else:  # горизонт изменён (например, 20 → 30): продолжаем cosine на новом горизонте с текущей эпохи
+                for g in optimizer.param_groups:
+                    g['initial_lr'] = args.lr
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, last_epoch=ckpt['epoch'])
+                if main_proc:
+                    print(f'resume: epochs {ckpt.get("args", {}).get("epochs")} → {args.epochs}, scheduler пересоздан, '
+                          f'lr на следующей эпохе {optimizer.param_groups[0]["lr"]:.2e}', flush=True)
         scaler.load_state_dict(ckpt['scaler'])
         best, best_epoch, global_step = ckpt['best'], ckpt['best_epoch'], ckpt.get('global_step', 0)
         wandb_id = ckpt.get('wandb_id')
