@@ -22,6 +22,17 @@ CUDA_VISIBLE_DEVICES=6 python src/train.py --run-name 20260902_baseline_r34_256 
     --select-by proxy --full-every 1 --workers 8 --amp
 ```
 
+**Несколько GPU (DDP)** — тот же скрипт через `torchrun`; `--batch-size` задаётся на каждую карту,
+lr автоматически не масштабируется (эффективный батч = batch × число карт):
+
+```bash
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node 2 src/train.py --run-name <имя> --batch-size 32 --workers 8 --amp ...
+```
+
+Валидацию и full-метрику считает rank 0, остальные ждут. Замер на A4000 (UNet-R34, 256², AMP):
+шаг модели 289 img/s на карту, загрузчик 727 img/s на 10 воркерах → одна карта ≈ 6 мин/эпоху,
+две ≈ 3.3 мин. Свободные карты смотреть через `scripts/gpu_free.sh`; больше двух — по договорённости (TEAM.md §4).
+
 Каждую эпоху в `log.jsonl` пишутся `train_loss`, `val_loss` (весь val-tune), `proxy` (Dice/FPR/AIC
 на тензорах, proxy-строки) и `full` (metric.py на PNG, те же строки, t=0.5). Чекпоинты:
 `last.pth`, `best_loss.pth`, `best_proxy.pth`, `best_full.pth`, `best.pth` (= по `--select-by`).
