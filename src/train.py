@@ -285,6 +285,7 @@ def main():
     ap.add_argument('--full-every', type=int, default=1, help='считать full-метрику каждые N эпох; 0 — никогда')
     ap.add_argument('--patience', type=int, default=5, help='стоп, если критерий --select-by не улучшался N эпох подряд; 0 — без остановки (D-12)')
     ap.add_argument('--resume', default=None, help='auto = <run_dir>/last.pth, либо путь к last.pth')
+    ap.add_argument('--rebuild-scheduler', action='store_true', help='при resume не восстанавливать scheduler, а построить заново на --epochs и прокрутить до текущей эпохи')
     ap.add_argument('--limit', type=int, default=0, help='отладка: ограничить число train-строк')
     ap.add_argument('--wandb', dest='wandb', action='store_true', default=True)
     ap.add_argument('--no-wandb', dest='wandb', action='store_false')
@@ -357,12 +358,18 @@ def main():
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         if scheduler and ckpt.get('scheduler'):
-            if ckpt.get('args', {}).get('epochs') == args.epochs:
+            if ckpt.get('args', {}).get('epochs') == args.epochs and not args.rebuild_scheduler:
                 scheduler.load_state_dict(ckpt['scheduler'])
-            else:  # горизонт изменён (например, 20 → 30): продолжаем cosine на новом горизонте с текущей эпохи
+            else:
+                # Горизонт изменён (например, 20 → 30) или --rebuild-scheduler: строим cosine на новом горизонте заново
+                # и прокручиваем его на ckpt['epoch'] шагов от базового lr. Через last_epoch=N делать НЕЛЬЗЯ:
+                # рекурсивная формула CosineAnnealingLR отталкивается от текущего lr, а он после старого
+                # расписания уже 0 — и остаётся 0 навсегда.
                 for g in optimizer.param_groups:
-                    g['initial_lr'] = args.lr
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, last_epoch=ckpt['epoch'])
+                    g['lr'] = args.lr
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+                for _ in range(ckpt['epoch']):
+                    scheduler.step()
                 if main_proc:
                     print(f'resume: epochs {ckpt.get("args", {}).get("epochs")} → {args.epochs}, scheduler пересоздан, '
                           f'lr на следующей эпохе {optimizer.param_groups[0]["lr"]:.2e}', flush=True)
