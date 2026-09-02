@@ -66,7 +66,7 @@ def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float
     rows = []
     with ThreadPoolExecutor(max_workers=max(4, workers)) as ex:
         futs = []
-        for batch in tqdm(dl, desc='predict', leave=False):
+        for batch in tqdm(dl, desc='predict', leave=False, disable=None):
             x = batch['image'].to(device, non_blocking=True)
             with torch.autocast('cuda', enabled=amp):
                 logits = model(x)

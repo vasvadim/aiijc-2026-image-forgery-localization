@@ -89,7 +89,7 @@ def validate(model, loader, criterion, device, df_val: pd.DataFrame, amp: bool):
     model.eval()
     total, n = 0.0, 0
     prox_idx, prox_dice, prox_area = [], [], []
-    for batch in tqdm(loader, desc='val', leave=False):
+    for batch in tqdm(loader, desc='val', leave=False, disable=None):
         x = batch['image'].to(device, non_blocking=True)
         y = batch['mask'].to(device, non_blocking=True)
         with torch.autocast('cuda', enabled=amp):
@@ -175,7 +175,7 @@ def main():
         t0 = time.time()
         model.train()
         tr_loss, nb = 0.0, 0
-        for batch in tqdm(dl_train, desc=f'train ep{epoch}', leave=False):
+        for batch in tqdm(dl_train, desc=f'train ep{epoch}', leave=False, disable=None):
             x = batch['image'].to(device, non_blocking=True)
             y = batch['mask'].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)

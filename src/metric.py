@@ -56,27 +56,31 @@ def aic(dice_pos: float, fpr_neg: float) -> float:
     return 0.0 if a + b == 0 else float(2 * a * b / (a + b))
 
 
+def _longest_run_center(ok: np.ndarray) -> int:
+    """Центр самого длинного непрерывного отрезка True; если True нет — 0."""
+    best_start, best_len, start = 0, 0, None
+    for i, v in enumerate(list(ok) + [False]):
+        if v and start is None:
+            start = i
+        if not v and start is not None:
+            if i - start > best_len:
+                best_start, best_len = start, i - start
+            start = None
+    return best_start + (best_len - 1) // 2
+
+
 def select_plateau(scores: np.ndarray, tol: float = 0.002) -> tuple[int, ...]:
     """Индекс центра самого широкого плато (значения >= max − tol) на 1D/2D сетке (D-05).
-    Для 2D сетки плато ищется по строкам (первая ось), внутри строки — по второй."""
+    2D: строка (первая ось) с наибольшим числом «хороших» ячеек (при равенстве — с большим
+    средним по ним), в ней — центр самого длинного отрезка «хороших» ячеек."""
     scores = np.asarray(scores, dtype=float)
     ok = scores >= scores.max() - tol
     if scores.ndim == 1:
-        best, cur_start, cur_len = (0, 0), None, 0
-        for i, v in enumerate(list(ok) + [False]):
-            if v and cur_start is None:
-                cur_start, cur_len = i, 0
-            if v:
-                cur_len += 1
-            elif cur_start is not None:
-                if cur_len > best[1]:
-                    best = (cur_start, cur_len)
-                cur_start = None
-        return (best[0] + best[1] // 2,)
-    # 2D: строка с наибольшим числом «хороших» ячеек, в ней — центр самого длинного отрезка
-    row = int(np.argmax(ok.sum(axis=1)))
-    col = select_plateau(np.where(ok[row], scores[row], -np.inf), tol=np.inf)[0]
-    return (row, col)
+        return (_longest_run_center(ok),)
+    cnt = ok.sum(axis=1)
+    mean_ok = np.where(cnt > 0, (scores * ok).sum(axis=1) / np.maximum(cnt, 1), -np.inf)
+    row = int(np.lexsort((mean_ok, cnt))[-1])
+    return (row, _longest_run_center(ok[row]))
 
 
 # ----------------------------------------------------------------------------- чтение файлов

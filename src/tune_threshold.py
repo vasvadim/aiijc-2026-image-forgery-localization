@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import data_dir, load_gt, load_split  # noqa: E402
 from metric import FA_AREA, MAIN_POOLS, aic, select_plateau  # noqa: E402
 
-T_GRID = np.round(np.arange(0.20, 0.81, 0.05), 2)
-AMIN_GRID = np.array([0.0, 0.002, 0.005, 0.01, 0.015, 0.02, 0.03, 0.05])
+T_GRID = np.round(np.arange(0.10, 0.96, 0.05), 2)
+AMIN_GRID = np.array([0.0, 0.002, 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10])
 
 
 def _one(args):
@@ -66,7 +66,7 @@ def main():
         keep = A >= a_min if a_min > 0 else np.ones_like(A, bool)               # маска не обнулена
         dice_pos = (D[is_pos] * keep[is_pos]).mean(axis=0)                       # [T]
         fa = (A >= FA_AREA) & keep
-        fprs = {p: fa[(~is_pos) & (pools == p)].mean(axis=0) for p in np.unique(pools[~is_pos])}
+        fprs = {str(p): fa[(~is_pos) & (pools == p)].mean(axis=0) for p in np.unique(pools[~is_pos])}
         main = [fprs[p] for p in MAIN_POOLS if p in fprs]
         fpr_main = np.mean(main, axis=0) if main else np.zeros(len(T_GRID))
         for i in range(len(T_GRID)):
@@ -89,6 +89,8 @@ def main():
     print(f'chosen (plateau center): t={chosen["t"]} a_min={chosen["a_min"]} AIC={chosen["aic"]:.4f} '
           f'dice={chosen["dice_pos"]:.4f} fpr_main={chosen["fpr_main"]:.4f} fpr={chosen["fpr"]}')
     print(f'argmax: {chosen["argmax"]}')
+    if i in (0, len(T_GRID) - 1) or j in (0, len(AMIN_GRID) - 1):
+        print('WARNING: выбранная точка на краю сетки — расширь T_GRID/AMIN_GRID или проверь модель')
     print(f'saved {args.out}')
 
 
