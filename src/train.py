@@ -136,6 +136,22 @@ def proxy_metrics(dice, area, df_proxy: pd.DataFrame) -> dict:
     return out
 
 
+def save_panel(panel: dict, df_val: pd.DataFrame, run_dir: Path, epoch: int) -> None:
+    """Композит картинка + GT (зелёный контур) + предсказание (красная заливка) → <run_dir>/panel/epNN_k.png."""
+    from PIL import Image
+    out = run_dir / 'panel'; out.mkdir(exist_ok=True)
+    for k, idx in enumerate(sorted(panel)):
+        img, gt, pred = panel[idx]
+        comp = img.astype(np.float32)
+        comp[pred] = comp[pred] * 0.5 + np.array([255, 0, 0]) * 0.5
+        er = gt.copy(); er[1:-1, 1:-1] = gt[1:-1, 1:-1] & gt[:-2, 1:-1] & gt[2:, 1:-1] & gt[1:-1, :-2] & gt[1:-1, 2:]
+        edge = gt & ~er
+        comp[edge] = [0, 255, 0]
+        r = df_val.iloc[idx]
+        tag = f"{r['domain']}_{'neg-' + r['neg_pool'] if r['is_neg'] else 'pos-' + str(round(float(r['gt_area']), 3))}"
+        Image.fromarray(comp.astype(np.uint8)).save(out / f'ep{epoch:02d}_{k}_{tag}.png')
+
+
 def _denorm(x: torch.Tensor) -> np.ndarray:
     img = x.cpu().numpy().transpose(1, 2, 0) * IMAGENET_STD + IMAGENET_MEAN
     return (np.clip(img, 0, 1) * 255).astype(np.uint8)
@@ -350,6 +366,7 @@ def main():
 
     wb = WandbLogger(args.wandb and main_proc, args.wandb_project, args.run_name, run_dir, config, wandb_id) if main_proc else None
     log_f = open(run_dir / 'log.jsonl', 'a', encoding='utf-8') if main_proc else None
+    steps_f = open(run_dir / 'steps.jsonl', 'a', encoding='utf-8') if main_proc else None
     stop_flag = torch.zeros(1, device=device)
     params = [p for p in ddp_model.parameters() if p.requires_grad]
 
@@ -377,8 +394,11 @@ def main():
             li = loss.item(); tr_loss += li; nb += 1; global_step += 1
             if np.isfinite(gn):
                 gn_sum += gn; gn_n += 1
-            if main_proc and wb and global_step % STEP_LOG_EVERY == 0:
-                wb.log({'train/step_loss': li, 'train/grad_norm': gn, 'global_step': global_step})
+            if main_proc and global_step % STEP_LOG_EVERY == 0:
+                if wb:
+                    wb.log({'train/step_loss': li, 'train/grad_norm': gn, 'global_step': global_step})
+                steps_f.write(json.dumps({'global_step': global_step, 'epoch': epoch, 'loss': li, 'grad_norm': gn,
+                                          'lr': optimizer.param_groups[0]['lr']}) + chr(10)); steps_f.flush()
         if scheduler:
             scheduler.step()
         tr_loss = all_reduce_mean(tr_loss / max(nb, 1), device)
@@ -414,6 +434,7 @@ def main():
                               rng=rng_state(), wandb_id=wb.run.id if (wb and wb.run) else None, args=vars(args))
             torch.save(full_state, run_dir / 'last.pth.tmp'); os.replace(run_dir / 'last.pth.tmp', run_dir / 'last.pth')
 
+            save_panel(panel, df_val, run_dir, epoch)
             if wb:
                 d = {'epoch': epoch, 'train/loss': tr_loss, 'val/loss': va_loss, 'val/gap_val_minus_train': va_loss - tr_loss,
                      'lr': lr_now, 'train/grad_norm_epoch': rec['grad_norm'], 'time/epoch_s': rec['time_s'],
@@ -442,7 +463,7 @@ def main():
             break
 
     if main_proc:
-        log_f.close()
+        log_f.close(); steps_f.close()
         src = run_dir / f'best_{args.select_by}.pth'
         if src.exists():
             shutil.copyfile(src, run_dir / 'best.pth')
