@@ -39,6 +39,18 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node 2 src/train.py --run-name <и
 Флаги: `--loss bce|bce_dice`, `--scheduler none|cosine`, `--limit N` (отладка), `--full-every 0` (без full),
 `--patience 5` — стоп, если критерий `--select-by` не улучшался 5 эпох подряд (D-12; 0 = выключить).
 
+**Продолжение прерванного обучения.** `last.pth` хранит полное состояние (веса, Adam с моментами,
+scheduler, GradScaler, эпоха, best, RNG, id W&B-рана). Та же команда + `--resume auto` продолжает
+со следующей эпохи в тот же W&B-ран. `best_*.pth` — только веса.
+
+**W&B.** Включён по умолчанию (`--no-wandb` выключает), проект `aic2026-detective`, имя рана = `--run-name`.
+Один раз на кластере: `pip install -r requirements.txt` и `wandb login` (ключ у Вадима, в репо не хранить).
+Логируются: train/val loss и их разрыв, proxy Dice/FPR по пулам/AIC, full-метрика, Dice по доменам и по
+площади GT, доля пустых прогнозов на позитивах, медиана площади на негативах, lr, норма градиента
+(по шагам и по эпохе), память GPU, время эпохи, `epochs_since_best`, панель из 8 фиксированных картинок
+с GT и предсказанием. `tune_threshold.py` и `predict.py --role val-report/control` дописывают свои числа
+в summary того же рана.
+
 ## 2. Вероятности на val-tune и подбор порога — `predict.py --save-probs` + `tune_threshold.py`
 
 ```bash

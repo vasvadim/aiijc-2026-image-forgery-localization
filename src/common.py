@@ -91,3 +91,15 @@ def normalize(img_uint8: np.ndarray) -> np.ndarray:
 
 def save_binary_png(mask_bool: np.ndarray, path: str | Path) -> None:
     Image.fromarray((mask_bool.astype(np.uint8) * 255), mode='L').save(path)
+
+
+def wandb_update_summary(run_dir: str | Path, data: dict) -> None:
+    """Дописать числа (порог, val-report, LB) в summary W&B-рана обучения, если он был (run_dir/wandb_id.txt)."""
+    try:
+        wid = (Path(run_dir) / 'wandb_id.txt').read_text().strip()
+        import wandb
+        run = wandb.init(id=wid, resume='must', project=os.environ.get('WANDB_PROJECT', 'aic2026-detective'), dir=str(run_dir))
+        run.summary.update(data)
+        run.finish()
+    except Exception as e:  # noqa: BLE001
+        print(f'wandb summary не обновлён: {e!r}')

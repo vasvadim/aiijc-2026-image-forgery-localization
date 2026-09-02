@@ -20,7 +20,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import data_dir, load_gt, load_split  # noqa: E402
+from common import data_dir, load_gt, load_split, wandb_update_summary  # noqa: E402
 from metric import FA_AREA, MAIN_POOLS, aic, select_plateau  # noqa: E402
 
 T_GRID = np.round(np.arange(0.10, 0.96, 0.05), 2)
@@ -92,6 +92,11 @@ def main():
     if i in (0, len(T_GRID) - 1) or j in (0, len(AMIN_GRID) - 1):
         print('WARNING: выбранная точка на краю сетки — расширь T_GRID/AMIN_GRID или проверь модель')
     print(f'saved {args.out}')
+    run_dir = Path(args.probs_dir).resolve().parents[1]
+    if (run_dir / 'wandb_id.txt').exists():
+        wandb_update_summary(run_dir, {'threshold/t': chosen['t'], 'threshold/a_min': chosen['a_min'],
+                                       'threshold/val_tune_aic': chosen['aic'], 'threshold/val_tune_dice': chosen['dice_pos'],
+                                       'threshold/val_tune_fpr_main': chosen['fpr_main'], 'threshold/grid': grid.round(4).tolist()})
 
 
 if __name__ == '__main__':

@@ -18,3 +18,4 @@ ipykernel>=6.29
 jupyter>=1.0
 fvcore>=0.1.5
 huggingface_hub[hf_xet]>=0.30
+wandb>=0.19

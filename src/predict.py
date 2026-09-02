@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import data_dir, load_split, load_test_df, save_binary_png, split_path  # noqa: E402
+from common import data_dir, load_split, load_test_df, save_binary_png, split_path, wandb_update_summary  # noqa: E402
 from data import SegDataset  # noqa: E402
 
 cv2.setNumThreads(0)
@@ -142,6 +142,12 @@ def main():
         res = evaluate(str(sub), str(split_file), None if args.role == 'control' else args.role, str(data_dir()), workers=args.workers)
         print(format_report(res, args.role))
         info['metrics'] = res
+        run_dir = Path(args.checkpoint).resolve().parent
+        if (run_dir / 'wandb_id.txt').exists() and args.role in ('val-report', 'val-tune', 'control'):
+            m = res['main']
+            wandb_update_summary(run_dir, {f'{args.role}/aic': m['aic_main'], f'{args.role}/dice_pos': m['dice_pos'],
+                                           f'{args.role}/fpr_main': m['fpr_main'], f'{args.role}/t': args.t, f'{args.role}/a_min': args.a_min,
+                                           **{f'{args.role}/fpr_{k}': v[0] for k, v in m['fpr'].items()}})
     (out / 'metrics.json').write_text(json.dumps(info, indent=1, ensure_ascii=False), encoding='utf-8')
     if args.zip:
         zpath = out / 'submission.zip'

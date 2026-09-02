@@ -7,7 +7,11 @@
              t=0.5, без a_min, только строки in_proxy=1 (секунды);
     full   — официальная metric.py на PNG в исходном разрешении, t=0.5, a_min=0, те же proxy-строки
              (~1 мин; --full-every N, чтобы считать реже, 0 — не считать).
-Сохраняются last.pth, best_loss.pth, best_proxy.pth, best_full.pth; best.pth = копия по --select-by.
+Чекпоинты: last.pth — ПОЛНОЕ состояние для продолжения (модель, оптимизатор с моментами, scheduler,
+GradScaler, эпоха, best, RNG); best_loss/best_proxy/best_full.pth — только веса; best.pth = по --select-by.
+Продолжить прерванное обучение: --resume auto (берёт <run_dir>/last.pth) или --resume <path>.
+Ранняя остановка: --patience N (критерий --select-by не улучшался N эпох подряд; 0 — выключить, D-12).
+W&B: --wandb (по умолчанию включён, если установлен wandb и сделан `wandb login`); --no-wandb выключает.
 Лог эпох: <run_dir>/log.jsonl. Конфиг: <run_dir>/config.json.
 
 Одна GPU:
@@ -22,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shutil
 import sys
 import time
@@ -38,12 +43,15 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import data_dir, load_split, runs_dir, seed_everything, split_path  # noqa: E402
+from common import IMAGENET_MEAN, IMAGENET_STD, data_dir, load_split, runs_dir, seed_everything, split_path  # noqa: E402
 from data import SegDataset  # noqa: E402
 from metric import MAIN_POOLS, aic  # noqa: E402
 from predict import predict_to_files  # noqa: E402
 
 FA_AREA = 0.01
+AREA_BUCKETS = [(0, 0.01, 'lt1'), (0.01, 0.05, '1-5'), (0.05, 0.20, '5-20'), (0.20, 1.01, 'gt20')]
+N_IMG_LOG = 8          # картинок в панели W&B (фиксированный набор из proxy)
+STEP_LOG_EVERY = 50    # шагов между логами train/step_loss
 
 
 # ----------------------------------------------------------------------------- DDP helpers
@@ -102,10 +110,10 @@ def make_loss(name: str) -> nn.Module:
 
 
 # ----------------------------------------------------------------------------- validation
-def proxy_metrics(dice_list, area_list, df_proxy: pd.DataFrame) -> dict:
-    """Dice per image по позитивам (is_neg==0), FPR по пулам среди негативов; как metric.aggregate, но на тензорах."""
-    d = np.array(dice_list)
-    a = np.array(area_list)
+def proxy_metrics(dice, area, df_proxy: pd.DataFrame) -> dict:
+    """Dice per image по позитивам (is_neg==0), FPR по пулам среди негативов (как metric.aggregate, но на
+    тензорах) + разрезы по доменам и площади GT, доля пустых прогнозов, медиана площади на негативах."""
+    d = np.asarray(dice); a = np.asarray(area)
     pos = df_proxy['is_neg'].values == 0
     dice_pos = float(d[pos].mean()) if pos.any() else float('nan')
     fpr = {}
@@ -114,15 +122,31 @@ def proxy_metrics(dice_list, area_list, df_proxy: pd.DataFrame) -> dict:
         fpr[pool] = float((a[sel] >= FA_AREA).mean())
     main = [fpr[p] for p in MAIN_POOLS if p in fpr]
     fpr_main = float(np.mean(main)) if main else float(np.mean(list(fpr.values()))) if fpr else 0.0
-    return dict(dice_pos=dice_pos, fpr=fpr, fpr_main=fpr_main, aic=aic(dice_pos, fpr_main))
+    out = dict(dice_pos=dice_pos, fpr=fpr, fpr_main=fpr_main, aic=aic(dice_pos, fpr_main),
+               empty_pred_on_pos=float((a[pos] == 0).mean()) if pos.any() else float('nan'),
+               neg_pred_area_median=float(np.median(a[~pos])) if (~pos).any() else float('nan'),
+               dice_by_domain={}, dice_by_area={})
+    dom = df_proxy['domain'].values
+    for dname in np.unique(dom[pos]):
+        out['dice_by_domain'][str(dname)] = float(d[pos & (dom == dname)].mean())
+    ga = df_proxy['gt_area'].astype(float).values
+    for lo, hi, name in AREA_BUCKETS:
+        sel = pos & (ga >= lo) & (ga < hi)
+        out['dice_by_area'][name] = float(d[sel].mean()) if sel.any() else float('nan')
+    return out
+
+
+def _denorm(x: torch.Tensor) -> np.ndarray:
+    img = x.cpu().numpy().transpose(1, 2, 0) * IMAGENET_STD + IMAGENET_MEAN
+    return (np.clip(img, 0, 1) * 255).astype(np.uint8)
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, df_val: pd.DataFrame, amp: bool):
-    """Один проход по val-tune: val loss на всех строках + proxy-метрики на in_proxy==1."""
+def validate(model, loader, criterion, device, df_val: pd.DataFrame, amp: bool, img_idx: set):
+    """Один проход по val-tune: val loss на всех строках + proxy-метрики на in_proxy==1 + панель картинок."""
     model.eval()
     total, n = 0.0, 0
-    prox_idx, prox_dice, prox_area = [], [], []
+    prox_idx, prox_dice, prox_area, panel = [], [], [], {}
     for batch in tqdm(loader, desc='val', leave=False, disable=None):
         x = batch['image'].to(device, non_blocking=True)
         y = batch['mask'].to(device, non_blocking=True)
@@ -133,16 +157,20 @@ def validate(model, loader, criterion, device, df_val: pd.DataFrame, amp: bool):
         idx = batch['idx'].numpy()
         inp = df_val['in_proxy'].values[idx] == 1
         if inp.any():
-            p = (torch.sigmoid(logits.float()) > 0.5)[inp]
+            prob = torch.sigmoid(logits.float())
+            p = (prob > 0.5)[inp]
             g = (y > 0.5)[inp]
             inter = (p & g).sum(dim=(1, 2, 3)).float()
             dice = (2 * inter / (p.sum(dim=(1, 2, 3)) + g.sum(dim=(1, 2, 3)) + 1e-6)).cpu().numpy()
             area = p.float().mean(dim=(1, 2, 3)).cpu().numpy()
             prox_idx.extend(idx[inp].tolist()); prox_dice.extend(dice.tolist()); prox_area.extend(area.tolist())
+            for j in np.where(inp)[0]:
+                if int(idx[j]) in img_idx:
+                    panel[int(idx[j])] = (_denorm(x[j]), (y[j, 0] > 0.5).cpu().numpy(), (prob[j, 0] > 0.5).cpu().numpy())
     order = np.argsort(prox_idx)
     df_proxy = df_val.iloc[np.array(prox_idx)[order]]
     pm = proxy_metrics(np.array(prox_dice)[order], np.array(prox_area)[order], df_proxy)
-    return total / max(n, 1), pm
+    return total / max(n, 1), pm, panel
 
 
 def full_metric(model, df_proxy, args, device, run_dir: Path, epoch: int) -> dict:
@@ -156,6 +184,69 @@ def full_metric(model, df_proxy, args, device, run_dir: Path, epoch: int) -> dic
     shutil.rmtree(out, ignore_errors=True)
     m = res['main']
     return dict(dice_pos=m['dice_pos'], fpr={k: v[0] for k, v in m['fpr'].items()}, fpr_main=m['fpr_main'], aic=m['aic_main'])
+
+
+# ----------------------------------------------------------------------------- W&B
+class WandbLogger:
+    """Тонкая обёртка: молчит, если wandb не установлен / не залогинен / выключен флагом."""
+
+    def __init__(self, enabled: bool, project: str, run_name: str, run_dir: Path, config: dict, resume_id: str | None):
+        self.run = None
+        if not enabled:
+            return
+        try:
+            import wandb
+            self.wandb = wandb
+            self.run = wandb.init(project=project, name=run_name, id=resume_id, resume='allow' if resume_id else None,
+                                  config=config, dir=str(run_dir))
+            wandb.define_metric('epoch')
+            wandb.define_metric('global_step')
+            wandb.define_metric('train/step_loss', step_metric='global_step')
+            wandb.define_metric('train/grad_norm', step_metric='global_step')
+            for prefix in ('train/', 'val/', 'proxy/', 'full/', 'time/', 'gpu/', 'lr', 'images/'):
+                wandb.define_metric(prefix + '*' if prefix.endswith('/') else prefix, step_metric='epoch')
+            (run_dir / 'wandb_id.txt').write_text(self.run.id)
+            print(f'wandb: {self.run.url}', flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f'wandb отключён: {e!r}', flush=True)
+            self.run = None
+
+    def log(self, d: dict):
+        if self.run:
+            self.run.log(d)
+
+    def images(self, panel: dict, df_val: pd.DataFrame, epoch: int):
+        if not self.run or not panel:
+            return
+        imgs = []
+        for idx in sorted(panel):
+            img, gt, pred = panel[idx]
+            r = df_val.iloc[idx]
+            cap = f"{r['domain']} {'NEG ' + r['neg_pool'] if r['is_neg'] else 'pos area=' + str(round(float(r['gt_area']), 3))}"
+            imgs.append(self.wandb.Image(img, caption=cap, masks={
+                'ground_truth': {'mask_data': gt.astype(np.uint8), 'class_labels': {0: 'bg', 1: 'gt'}},
+                'prediction': {'mask_data': pred.astype(np.uint8) * 2, 'class_labels': {0: 'bg', 2: 'pred'}}}))
+        self.run.log({'images/proxy_panel': imgs, 'epoch': epoch})
+
+    def summary(self, d: dict):
+        if self.run:
+            self.run.summary.update(d)
+
+    def finish(self):
+        if self.run:
+            self.run.finish()
+
+
+# ----------------------------------------------------------------------------- checkpoint
+def rng_state() -> dict:
+    return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
+
+
+def set_rng_state(s: dict) -> None:
+    random.setstate(s['python']); np.random.set_state(s['numpy']); torch.set_rng_state(s['torch'])
+    if s.get('cuda') is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(s['cuda'])
 
 
 # ----------------------------------------------------------------------------- main
@@ -177,7 +268,11 @@ def main():
     ap.add_argument('--select-by', default='proxy', choices=['loss', 'proxy', 'full'])
     ap.add_argument('--full-every', type=int, default=1, help='считать full-метрику каждые N эпох; 0 — никогда')
     ap.add_argument('--patience', type=int, default=5, help='стоп, если критерий --select-by не улучшался N эпох подряд; 0 — без остановки (D-12)')
+    ap.add_argument('--resume', default=None, help='auto = <run_dir>/last.pth, либо путь к last.pth')
     ap.add_argument('--limit', type=int, default=0, help='отладка: ограничить число train-строк')
+    ap.add_argument('--wandb', dest='wandb', action='store_true', default=True)
+    ap.add_argument('--no-wandb', dest='wandb', action='store_false')
+    ap.add_argument('--wandb-project', default='aic2026-detective')
     args = ap.parse_args()
 
     rank, world, local_rank = ddp_setup()
@@ -188,17 +283,37 @@ def main():
     args.split_file = split_path(args.version)
     if main_proc:
         run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / 'config.json').write_text(json.dumps({**vars(args), 'split_file': str(args.split_file),
-                                                         'world_size': world}, indent=2, ensure_ascii=False))
     barrier()
+
+    # --- resume: читаем полный чекпоинт до создания модели
+    ckpt = None
+    if args.resume:
+        rp = run_dir / 'last.pth' if args.resume == 'auto' else Path(args.resume)
+        if rp.exists():
+            ckpt = torch.load(rp, map_location='cpu', weights_only=False)
+            if main_proc:
+                print(f'resume from {rp}: epoch {ckpt["epoch"]} done', flush=True)
+        elif main_proc:
+            print(f'resume: {rp} не найден, начинаю с нуля', flush=True)
+    start_epoch = (ckpt['epoch'] + 1) if ckpt else 1
+    config = {**vars(args), 'split_file': str(args.split_file), 'world_size': world}
+    if main_proc:
+        (run_dir / 'config.json').write_text(json.dumps(config, indent=2, ensure_ascii=False, default=str))
 
     df_train = load_split(args.version, 'train')
     if args.limit:
         df_train = df_train.sample(n=args.limit, random_state=args.seed).reset_index(drop=True)
     df_val = load_split(args.version, 'val-tune')
     df_proxy = df_val[df_val['in_proxy'] == 1].reset_index(drop=True)
+    # фиксированная панель картинок: 4 позитива, 2 neg_train, 2 neg_src из proxy
+    rng = np.random.RandomState(args.seed)
+    pv = df_val[df_val['in_proxy'] == 1]
+    img_idx = set()
+    for cond, k in ((pv['is_neg'] == 0, N_IMG_LOG // 2), (pv['neg_pool'] == 'neg_train', N_IMG_LOG // 4), (pv['neg_pool'] == 'neg_src', N_IMG_LOG // 4)):
+        cand = pv.index[cond].values
+        img_idx.update(int(i) for i in rng.choice(cand, size=min(k, len(cand)), replace=False))
     if main_proc:
-        print(f'train={len(df_train)} val-tune={len(df_val)} proxy={len(df_proxy)} world={world} run_dir={run_dir}')
+        print(f'train={len(df_train)} val-tune={len(df_val)} proxy={len(df_proxy)} world={world} run_dir={run_dir}', flush=True)
 
     ds_train = SegDataset(df_train, args.img_size, train=True)
     sampler = DistributedSampler(ds_train, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None
@@ -209,7 +324,7 @@ def main():
         dl_val = DataLoader(SegDataset(df_val, args.img_size, train=False), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
 
-    model = build_model(args.encoder).to(device)
+    model = build_model(args.encoder, weights=None if ckpt else 'imagenet').to(device)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     ddp_model = DDP(model, device_ids=[local_rank]) if world > 1 else model
@@ -220,14 +335,31 @@ def main():
 
     best = {'loss': float('inf'), 'proxy': -1.0, 'full': -1.0}
     best_epoch = {'loss': 0, 'proxy': 0, 'full': 0}
+    global_step = 0
+    wandb_id = None
+    if ckpt:
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        if scheduler and ckpt.get('scheduler'):
+            scheduler.load_state_dict(ckpt['scheduler'])
+        scaler.load_state_dict(ckpt['scaler'])
+        best, best_epoch, global_step = ckpt['best'], ckpt['best_epoch'], ckpt.get('global_step', 0)
+        wandb_id = ckpt.get('wandb_id')
+        if main_proc and ckpt.get('rng'):
+            set_rng_state(ckpt['rng'])
+
+    wb = WandbLogger(args.wandb and main_proc, args.wandb_project, args.run_name, run_dir, config, wandb_id) if main_proc else None
     log_f = open(run_dir / 'log.jsonl', 'a', encoding='utf-8') if main_proc else None
     stop_flag = torch.zeros(1, device=device)
-    for epoch in range(1, args.epochs + 1):
+    params = [p for p in ddp_model.parameters() if p.requires_grad]
+
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         if sampler is not None:
             sampler.set_epoch(epoch)
         ddp_model.train()
-        tr_loss, nb = 0.0, 0
+        tr_loss, nb, gn_sum, gn_n = 0.0, 0, 0.0, 0
+        torch.cuda.reset_peak_memory_stats(device)
         for batch in tqdm(dl_train, desc=f'train ep{epoch}', leave=False, disable=None if main_proc else True):
             x = batch['image'].to(device, non_blocking=True)
             y = batch['mask'].to(device, non_blocking=True)
@@ -238,34 +370,68 @@ def main():
                 logits = ddp_model(x)
             loss = criterion(logits.float(), y)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            gn = torch.nn.utils.clip_grad_norm_(params, max_norm=1e9).item()   # только измеряем, не режем
             scaler.step(optimizer)
             scaler.update()
-            tr_loss += loss.item(); nb += 1
+            li = loss.item(); tr_loss += li; nb += 1; global_step += 1
+            if np.isfinite(gn):
+                gn_sum += gn; gn_n += 1
+            if main_proc and wb and global_step % STEP_LOG_EVERY == 0:
+                wb.log({'train/step_loss': li, 'train/grad_norm': gn, 'global_step': global_step})
         if scheduler:
             scheduler.step()
         tr_loss = all_reduce_mean(tr_loss / max(nb, 1), device)
         t_train = time.time() - t0
 
         if main_proc:
-            va_loss, pm = validate(model, dl_val, criterion, device, df_val, args.amp)
+            va_loss, pm, panel = validate(model, dl_val, criterion, device, df_val, args.amp, img_idx)
             fm = None
             if args.full_every and (epoch % args.full_every == 0 or epoch == args.epochs):
                 fm = full_metric(model, df_proxy, args, device, run_dir, epoch)
-            rec = dict(epoch=epoch, train_loss=tr_loss, val_loss=va_loss, proxy=pm, full=fm,
-                       lr=optimizer.param_groups[0]['lr'], time_s=round(time.time() - t0), train_time_s=round(t_train))
+            lr_now = optimizer.param_groups[0]['lr']
+            rec = dict(epoch=epoch, train_loss=tr_loss, val_loss=va_loss, proxy=pm, full=fm, lr=lr_now,
+                       grad_norm=gn_sum / max(gn_n, 1), time_s=round(time.time() - t0), train_time_s=round(t_train),
+                       gpu_max_mem_gb=round(torch.cuda.max_memory_allocated(device) / 2**30, 2))
             log_f.write(json.dumps(rec, ensure_ascii=False) + '\n'); log_f.flush()
             print(f'ep{epoch} train={tr_loss:.4f} val={va_loss:.4f} | proxy dice={pm["dice_pos"]:.4f} '
                   f'fpr={pm["fpr_main"]:.4f} aic={pm["aic"]:.4f}'
                   + (f' | full dice={fm["dice_pos"]:.4f} fpr={fm["fpr_main"]:.4f} aic={fm["aic"]:.4f}' if fm else '')
-                  + f' | {rec["time_s"]}s (train {rec["train_time_s"]}s)', flush=True)
-            state = dict(epoch=epoch, model=model.state_dict(), encoder=args.encoder, img_size=args.img_size, metrics=rec)
-            torch.save(state, run_dir / 'last.pth')
+                  + f' | lr={lr_now:.2e} gn={rec["grad_norm"]:.2f} mem={rec["gpu_max_mem_gb"]}G | {rec["time_s"]}s (train {rec["train_time_s"]}s)', flush=True)
+
             if va_loss < best['loss']:
-                best['loss'] = va_loss; best_epoch['loss'] = epoch; torch.save(state, run_dir / 'best_loss.pth')
+                best['loss'] = va_loss; best_epoch['loss'] = epoch
             if pm['aic'] > best['proxy']:
-                best['proxy'] = pm['aic']; best_epoch['proxy'] = epoch; torch.save(state, run_dir / 'best_proxy.pth')
+                best['proxy'] = pm['aic']; best_epoch['proxy'] = epoch
             if fm and fm['aic'] > best['full']:
-                best['full'] = fm['aic']; best_epoch['full'] = epoch; torch.save(state, run_dir / 'best_full.pth')
+                best['full'] = fm['aic']; best_epoch['full'] = epoch
+            weights = dict(epoch=epoch, model=model.state_dict(), encoder=args.encoder, img_size=args.img_size, metrics=rec)
+            for crit in ('loss', 'proxy', 'full'):
+                if best_epoch[crit] == epoch:
+                    torch.save(weights, run_dir / f'best_{crit}.pth')
+            full_state = dict(weights, optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict() if scheduler else None,
+                              scaler=scaler.state_dict(), best=best, best_epoch=best_epoch, global_step=global_step,
+                              rng=rng_state(), wandb_id=wb.run.id if (wb and wb.run) else None, args=vars(args))
+            torch.save(full_state, run_dir / 'last.pth.tmp'); os.replace(run_dir / 'last.pth.tmp', run_dir / 'last.pth')
+
+            if wb:
+                d = {'epoch': epoch, 'train/loss': tr_loss, 'val/loss': va_loss, 'val/gap_val_minus_train': va_loss - tr_loss,
+                     'lr': lr_now, 'train/grad_norm_epoch': rec['grad_norm'], 'time/epoch_s': rec['time_s'],
+                     'time/train_s': rec['train_time_s'], 'gpu/max_mem_gb': rec['gpu_max_mem_gb'],
+                     'proxy/dice_pos': pm['dice_pos'], 'proxy/fpr_main': pm['fpr_main'], 'proxy/aic': pm['aic'],
+                     'proxy/empty_pred_on_pos': pm['empty_pred_on_pos'], 'proxy/neg_pred_area_median': pm['neg_pred_area_median'],
+                     'best/proxy_aic': best['proxy'], 'best/epoch_proxy': best_epoch['proxy'],
+                     'epochs_since_best': epoch - best_epoch[args.select_by]}
+                d.update({f'proxy/fpr_{k}': v for k, v in pm['fpr'].items()})
+                d.update({f'proxy/dice_domain_{k}': v for k, v in pm['dice_by_domain'].items()})
+                d.update({f'proxy/dice_area_{k}': v for k, v in pm['dice_by_area'].items()})
+                if fm:
+                    d.update({'full/dice_pos': fm['dice_pos'], 'full/fpr_main': fm['fpr_main'], 'full/aic': fm['aic']})
+                    d.update({f'full/fpr_{k}': v for k, v in fm['fpr'].items()})
+                wb.log(d)
+                wb.images(panel, df_val, epoch)
+                wb.summary({'best': best, 'best_epoch': best_epoch})
+
             if args.patience and epoch - best_epoch[args.select_by] >= args.patience:
                 print(f'early stop: {args.select_by} не улучшался {args.patience} эпох (лучшая эпоха {best_epoch[args.select_by]})', flush=True)
                 stop_flag.fill_(1)
@@ -281,7 +447,9 @@ def main():
         if src.exists():
             shutil.copyfile(src, run_dir / 'best.pth')
         (run_dir / 'best.json').write_text(json.dumps({'select_by': args.select_by, 'best': best, 'best_epoch': best_epoch}, indent=2))
-        print('done; best:', best)
+        print('done; best:', best, best_epoch, flush=True)
+        if wb:
+            wb.finish()
     if is_dist():
         dist.destroy_process_group()
 
