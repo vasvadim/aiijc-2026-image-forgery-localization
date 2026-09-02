@@ -176,6 +176,7 @@ def main():
     ap.add_argument('--channels-last', action='store_true')
     ap.add_argument('--select-by', default='proxy', choices=['loss', 'proxy', 'full'])
     ap.add_argument('--full-every', type=int, default=1, help='считать full-метрику каждые N эпох; 0 — никогда')
+    ap.add_argument('--patience', type=int, default=5, help='стоп, если критерий --select-by не улучшался N эпох подряд; 0 — без остановки (D-12)')
     ap.add_argument('--limit', type=int, default=0, help='отладка: ограничить число train-строк')
     args = ap.parse_args()
 
@@ -218,7 +219,9 @@ def main():
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
     best = {'loss': float('inf'), 'proxy': -1.0, 'full': -1.0}
+    best_epoch = {'loss': 0, 'proxy': 0, 'full': 0}
     log_f = open(run_dir / 'log.jsonl', 'a', encoding='utf-8') if main_proc else None
+    stop_flag = torch.zeros(1, device=device)
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         if sampler is not None:
@@ -258,19 +261,26 @@ def main():
             state = dict(epoch=epoch, model=model.state_dict(), encoder=args.encoder, img_size=args.img_size, metrics=rec)
             torch.save(state, run_dir / 'last.pth')
             if va_loss < best['loss']:
-                best['loss'] = va_loss; torch.save(state, run_dir / 'best_loss.pth')
+                best['loss'] = va_loss; best_epoch['loss'] = epoch; torch.save(state, run_dir / 'best_loss.pth')
             if pm['aic'] > best['proxy']:
-                best['proxy'] = pm['aic']; torch.save(state, run_dir / 'best_proxy.pth')
+                best['proxy'] = pm['aic']; best_epoch['proxy'] = epoch; torch.save(state, run_dir / 'best_proxy.pth')
             if fm and fm['aic'] > best['full']:
-                best['full'] = fm['aic']; torch.save(state, run_dir / 'best_full.pth')
+                best['full'] = fm['aic']; best_epoch['full'] = epoch; torch.save(state, run_dir / 'best_full.pth')
+            if args.patience and epoch - best_epoch[args.select_by] >= args.patience:
+                print(f'early stop: {args.select_by} не улучшался {args.patience} эпох (лучшая эпоха {best_epoch[args.select_by]})', flush=True)
+                stop_flag.fill_(1)
+        if is_dist():
+            dist.broadcast(stop_flag, src=0)
         barrier()
+        if stop_flag.item():
+            break
 
     if main_proc:
         log_f.close()
         src = run_dir / f'best_{args.select_by}.pth'
         if src.exists():
             shutil.copyfile(src, run_dir / 'best.pth')
-        (run_dir / 'best.json').write_text(json.dumps({'select_by': args.select_by, **best}, indent=2))
+        (run_dir / 'best.json').write_text(json.dumps({'select_by': args.select_by, 'best': best, 'best_epoch': best_epoch}, indent=2))
         print('done; best:', best)
     if is_dist():
         dist.destroy_process_group()

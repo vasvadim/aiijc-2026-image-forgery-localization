@@ -36,7 +36,8 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node 2 src/train.py --run-name <и
 Каждую эпоху в `log.jsonl` пишутся `train_loss`, `val_loss` (весь val-tune), `proxy` (Dice/FPR/AIC
 на тензорах, proxy-строки) и `full` (metric.py на PNG, те же строки, t=0.5). Чекпоинты:
 `last.pth`, `best_loss.pth`, `best_proxy.pth`, `best_full.pth`, `best.pth` (= по `--select-by`).
-Флаги: `--loss bce|bce_dice`, `--scheduler none|cosine`, `--limit N` (отладка), `--full-every 0` (без full).
+Флаги: `--loss bce|bce_dice`, `--scheduler none|cosine`, `--limit N` (отладка), `--full-every 0` (без full),
+`--patience 5` — стоп, если критерий `--select-by` не улучшался 5 эпох подряд (D-12; 0 = выключить).
 
 ## 2. Вероятности на val-tune и подбор порога — `predict.py --save-probs` + `tune_threshold.py`
 
