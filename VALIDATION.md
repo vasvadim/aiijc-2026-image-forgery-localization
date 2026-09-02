@@ -5,8 +5,9 @@
 > через обсуждение и записано в [DECISIONS.md](DECISIONS.md) (D-01 … D-10). Менять что-либо
 > из этого файла = новая версия валидации (см. §7), а не правка на месте.
 
-Статус: **спецификация утверждена 02.09.2026, реализация ещё не начата**
-(`src/make_split.py`, `src/metric.py`, `splits/stage1_v1.csv` — предстоит написать).
+Статус: **спецификация утверждена и реализована 02.09.2026.** `src/make_split.py` → `splits/stage1_v1.csv.gz`
+(+ `_dropped.csv`, `_summary.md`, `nanobanana_control_v1.csv`), `src/metric.py` (self-test:
+`python src/metric.py --selftest`). Фактические размеры ролей — в `splits/stage1_v1_summary.md` и §4.
 
 ---
 
@@ -41,18 +42,22 @@
 - **Наши маски строго `{0, 255}`, режим `L`, размер = размеру картинки.** Несовпадение размера
   на платформе, скорее всего, ноль за весь сабмит. `metric.py` на этом **падает с ошибкой**.
 
-## 2. Что известно о данных (EDA на кластере, 02.09.2026, выборки 4 000–6 000 строк)
+## 2. Что известно о данных (EDA на кластере 02.09.2026; счётчики по всему train из `make_split.py`)
 
-Train: 103 699 строк, все `.jpg`.
+Train: 103 699 строк, все `.jpg`. Имена доменов ниже — те, что пишет `make_split.py` в колонку `domain`.
 
-| Семейство (по имени файла) | Строк | Оригинал `src` | Пример имени |
+| `domain` | Строк | Оригинал `src` | Пример имени |
 |---|---|---|---|
-| coco | 33 483 | есть | `8d13de81e6c8_coco_000000059319_powerpaint_realisticvision_1_Blended.jpg` |
-| 9-значный id, без подчёркиваний | 23 955 | нет | `000196093.jpg` (маска `000208846.png`) |
-| raise (`Qxx` = JPEG-качество источника) | 11 802 | есть | `71e3ddc694b8_raise_rbda4cda5t_Q72_removeanything_lama_1_None.jpg` |
-| D01…D44 | ~14 000 | нет | `f1965a0fb349_D17_I_nat_0074_large_1_inpainted-0.jpg`, `..._D44_L4S4C3_small_0_inpainted-0.jpg` |
-| openimages | 2 954 | есть | `c9e64665cc54_openimages_bd3895b63372e1f2_removeanything_lama_1_None.jpg` |
-| негативы `_0003xxxx` | ~2 700 (2.6 %) | нет | `d8aa3363436d_00030709.jpg` (пустая маска) |
+| `coco` | 33 483 | есть | `8d13de81e6c8_coco_000000059319_powerpaint_realisticvision_1_Blended.jpg` |
+| `ids9` (9-значный id, без подчёркиваний) | 23 955 | нет | `000196093.jpg` (маска `000208846.png`) |
+| `Dxx` (D01…D44) | 13 255 | нет | `f1965a0fb349_D17_I_nat_0074_large_1_inpainted-0.jpg`, `..._D44_L4S4C3_small_0_inpainted-0.jpg` |
+| `raise` (`Qxx` = JPEG-качество источника) | 11 802 | есть | `71e3ddc694b8_raise_rbda4cda5t_Q72_removeanything_lama_1_None.jpg` |
+| `ids8` (8-значный id) | 11 581 | нет | позитивы `0002112af8b4_00007597.jpg` (id 00000000–00014367), **все 3 118 негативов train** `d8aa3363436d_00030709.jpg` (id 00030001–00034999); размеры 640×480-семейства |
+| `inp` (как Dxx, но без D-префикса) | 6 669 | нет | `1577d931e81e_3230101918_medium_3_inpainted-0.jpg` |
+| `openimages` | 2 954 | есть | `c9e64665cc54_openimages_bd3895b63372e1f2_removeanything_lama_1_None.jpg` |
+
+Негативов (пустая GT при `>128`) в train **3 118 = 3.0 %**, все в `ids8`. Битых пар (маска ≠ размер
+картинки) **162**, список в `splits/stage1_v1_dropped.csv`.
 
 - Генераторы (из имени): removeanything/lama 14.9k, inpaintanything+sd2 15k, brushnet 7.1k,
   powerpaint 6.8k, hdpainter 6k; чекпоинты SD: realisticvision, dreamshaper, juggernaut, epicrealism,
@@ -72,11 +77,11 @@ Train: 103 699 строк, все `.jpg`.
 
 ## 3. Негативы: три пула (D-01)
 
-| Пул | Откуда | Сколько доступно | Роль |
+| Пул | Откуда | В v1 (val-tune / val-report) | Роль |
 |---|---|---|---|
-| `neg_train` | строки train с пустой GT (`_0003xxxx`) | ~2 700 | **основной**; ближе всего к тому, что организаторы называют negative |
-| `neg_src` | `src`-оригиналы сцен, попавших в holdout | ~5k в val-tune, ~2.5k в val-report (берём до 2 000 / 1 000) | **основной**; hard negatives тех же доменов |
-| `neg_nb` | `src`-оригиналы nanobanana | 2 000 случайных | **контрольный**: печатаем, при подборе порога не используем |
+| `neg_train` | строки train с пустой GT (домен `ids8`, всего 3 118) | 1 247 / 624 (ещё 1 247 в train) | **основной**; ближе всего к тому, что организаторы называют negative |
+| `neg_src` | `src`-оригиналы сцен, попавших в holdout (coco/raise/openimages) | 2 000 / 1 000 (кап; доступно ~5k / ~2.5k) | **основной**; hard negatives тех же доменов |
+| `neg_nb` | `src`-оригиналы nanobanana (`splits/nanobanana_control_v1.csv`) | 2 000, роль `control` | **контрольный**: печатаем, при подборе порога не используем |
 
 FPR печатается по каждому пулу отдельно. Для подбора порога используется
 `FPR_main = (FPR_neg_train + FPR_neg_src) / 2` (равные веса, чтобы 2k src не «задавили» 1k настоящих).
@@ -89,16 +94,28 @@ FPR печатается по каждому пулу отдельно. Для �
 
 ## 4. Разбиение (D-02, D-03, D-06)
 
-- **Единица разбиения — сцена** (`group_id`), не строка. `group_id` вытаскивается из имени:
-  coco → `coco_000000059319`; raise → `raise_rbda4cda5t`; openimages → `openimages_<hex>`;
-  D-семейства → `D17_I_nat_0074` / `D44_L4S4C3`; 9-значные → сам id; негативы → сам id.
+- **Единица разбиения — сцена** (`group_id`), не строка. `group_id` вытаскивается из имени
+  (`parse_name` в `make_split.py`): coco → `coco_000000059319`; raise → `raise_rbda4cda5t`;
+  openimages → `openimages_<hex>`; Dxx → `D_I_nat_0074` / `D_L4S4C3` (**префикс Dxx отброшен**: одна
+  сцена может встречаться в разных Dxx, группируем консервативно); inp → `inp_3230101918`;
+  ids9/ids8 → сам id (в них повторов нет, каждая строка — своя сцена).
   Все правки одной сцены и её `src` идут в одну роль. `make_split.py` содержит тест на утечку.
 - **20 фолдов по ~5 % сцен**, group-стратифицированно по домену и генератору (`StratifiedGroupKFold`,
-  `seed=42`). Роли: `val-tune` = фолды {0, 1} (~10k), `val-report` = фолд {2} (~5k),
-  `train` = фолды {3…19} (~88k). Резерв: 5-fold CV = 4 фолда на блок, split не пересобирается.
+  `seed=42`; страты < 100 строк слиты в `<domain>/rare`). Роли: `val-tune` = фолды {0, 1},
+  `val-report` = фолд {2}, `train` = фолды {3…19}. Резерв: 5-fold CV = 4 фолда на блок,
+  split не пересобирается.
 - **Негативы `neg_train` распределяются иначе**: 60 % сцен в holdout (в пропорции 2:1 между
-  val-tune и val-report → ~1 080 / ~540), 40 % (~1 080) в train. Пропорциональный 10 % дал бы
-  ~270 негативов для FPR — слишком шумно.
+  val-tune и val-report), 40 % в train. Пропорциональный 10 % дал бы ~300 негативов для FPR —
+  слишком шумно.
+- **Фактические размеры v1** (после выкидывания 162 битых пар):
+
+  | role | строк | позитивов | neg_train | neg_src | proxy |
+  |---|---|---|---|---|---|
+  | train | 86 605 | 85 358 | 1 247 | 0 | 0 |
+  | val-tune | 13 285 | 10 038 | 1 247 | 2 000 | 4 747 |
+  | val-report | 6 647 | 5 023 | 624 | 1 000 | 0 |
+
+  Доли доменов в val-tune совпадают с train до третьего знака (см. `splits/stage1_v1_summary.md`).
 - **Домены и генераторы пропорционально train** (тест похож на train). Разрез по доменам печатается
   отдельной таблицей, общий AIC остаётся сравнимым с лидербордом.
 - **`proxy`** = 1 500 позитивов из фолда 0 + все негативы val-tune; фиксированный список, по нему
@@ -137,10 +154,14 @@ FPR по пулам, AIC при GT `>0` и `>128`, долю пустых пре�
 
 ## 7. Версионирование (D-09)
 
-- `splits/stage1_v1.csv` — колонки: `chng_img_path, gt_path, orgl_img_path, domain, generator,
-  group_id, fold, role (train|val-tune|val-report), is_neg, neg_pool (neg_train|neg_src|""),
-  in_proxy`. Плюс `splits/nanobanana_control_v1.csv` и `splits/stage1_v1_dropped.csv`.
-- Генерируется `src/make_split.py --seed 42`; скрипт в репо, файл в репо.
+- `splits/stage1_v1.csv.gz` (gzip, `pd.read_csv` читает напрямую; 4 MB) — колонки:
+  `chng_img_path, gt_path, orgl_img_path, domain, generator, group_id, fold, role
+  (train|val-tune|val-report), is_neg, neg_pool (neg_train|neg_src|""), in_proxy, H, W, gt_area`.
+  Строки `neg_src` — это `src`-файлы: `chng_img_path` указывает на оригинал, `gt_path` пустой.
+  Пути относительно `AIC_DATA_DIR`. Плюс `splits/nanobanana_control_v1.csv` (те же колонки,
+  `role=control`, `neg_pool=neg_nb`), `splits/stage1_v1_dropped.csv`, `splits/stage1_v1_summary.md`.
+- Генерируется `src/make_split.py --version v1 --seed 42 --workers 32` на кластере (читает все
+  маски, ~1–2 мин); скрипт отказывается перезаписывать существующую версию без `--force`.
 - **`v1` никогда не редактируется.** Любое изменение состава, порога GT, списка выкинутых, формулы →
   `v2`. В `experiments.md` у каждой строки колонка «валидация: v1/v2». Числа с разных версий рядом
   не сравниваются. `metric.py` печатает свой `VERSION`.
