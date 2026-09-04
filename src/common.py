@@ -13,7 +13,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True   # среди src-оригиналов есть обрезанные JPEG (04.09) — читаем, что есть, вместо OSError
 
 REPO = Path(__file__).resolve().parents[1]
 GT_THRESH = 128
