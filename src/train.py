@@ -397,7 +397,9 @@ def main():
     cls_criterion = nn.BCEWithLogitsLoss()
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
-    ddp_model = DDP(model, device_ids=[local_rank]) if world > 1 else model
+    # find_unused_parameters: у timm-efficientnet часть параметров не попадает в граф (DDP падал с
+    # «did not receive grad», indices 413–415); небольшой оверхед, зато работает для любого энкодера
+    ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True) if world > 1 else model
     criterion = make_loss(args.loss)
     optimizer = torch.optim.Adam(ddp_model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs) if args.scheduler == 'cosine' else None
