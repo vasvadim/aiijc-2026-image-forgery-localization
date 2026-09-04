@@ -26,7 +26,7 @@ from metric import FA_AREA, MAIN_POOLS, aic, select_plateau  # noqa: E402
 
 T_GRID = np.round(np.arange(0.10, 0.96, 0.05), 2)
 AMIN_GRID = np.array([0.0, 0.002, 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10])
-TAU_GRID = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])   # порог image-level головы (0 = без гейтинга)
+TAU_GRID = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99])   # порог image-level головы (0 = без гейтинга)
 
 
 def _one(args):
@@ -115,8 +115,8 @@ def main():
     print(f'chosen (plateau center): t={chosen["t"]} a_min={chosen["a_min"]} tau={chosen["tau"]} AIC={chosen["aic"]:.4f} '
           f'dice={chosen["dice_pos"]:.4f} fpr_main={chosen["fpr_main"]:.4f} fpr={chosen["fpr"]}')
     print(f'argmax: {chosen["argmax"]}')
-    if i in (0, len(T_GRID) - 1) or j in (0, len(AMIN_GRID) - 1):
-        print('WARNING: выбранная точка на краю сетки — расширь T_GRID/AMIN_GRID или проверь модель')
+    if i in (0, len(T_GRID) - 1) or j in (0, len(AMIN_GRID) - 1) or (len(taus) > 1 and tau == taus[-1]):
+        print('WARNING: выбранная точка на краю сетки (t/a_min/tau) — расширь сетку или проверь модель')
     print(f'saved {args.out}')
     run_dir = Path(args.probs_dir).resolve().parents[1]
     if (run_dir / 'wandb_id.txt').exists():
