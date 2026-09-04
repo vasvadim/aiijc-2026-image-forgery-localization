@@ -79,7 +79,8 @@ tr.best td{font-weight:600;color:var(--accent)}
 <script id="data" type="application/json">__DATA__</script>
 <script>
 const DATA = JSON.parse(document.getElementById('data').textContent);
-const M = DATA.main, REFS = DATA.refs || [], R = REFS[0] || null, E = M.epochs, RE = R ? R.epochs : [];
+const M = DATA.main, REFS = (DATA.refs || []).filter(r=>r.epochs.length), R = REFS[0] || null, E = M.epochs, RE = R ? R.epochs : [];
+if (!E.length) { document.getElementById('title').textContent = M.name; document.getElementById('subtitle').textContent = 'первая эпоха ещё не завершилась — обновлено ' + DATA.generated; throw new Error('no epochs yet'); }
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const f4 = x => (x==null||Number.isNaN(x)) ? '—' : (+x).toFixed(4);
 const f3 = x => (x==null||Number.isNaN(x)) ? '—' : (+x).toFixed(3);
