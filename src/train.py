@@ -43,7 +43,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import IMAGENET_MEAN, IMAGENET_STD, data_dir, load_split, runs_dir, seed_everything, split_path  # noqa: E402
+from common import IMAGENET_MEAN, IMAGENET_STD, data_dir, load_split, parse_size, runs_dir, seed_everything, split_path  # noqa: E402
 from data import SegDataset  # noqa: E402
 from metric import MAIN_POOLS, aic  # noqa: E402
 from predict import predict_to_files  # noqa: E402
@@ -83,10 +83,19 @@ def all_reduce_mean(x: float, device) -> float:
 
 
 # ----------------------------------------------------------------------------- model / loss
-def build_model(encoder: str, weights: str | None = 'imagenet', aux_head: bool = False) -> nn.Module:
-    """UNet; с aux_head=True возвращает (mask_logits, img_logit) — image-level голова «есть ли правка»."""
+def build_model(encoder: str, weights: str | None = 'imagenet', aux_head: bool = False, decoder_channels=None) -> nn.Module:
+    """UNet; с aux_head=True возвращает (mask_logits, img_logit) — image-level голова «есть ли правка».
+    decoder_channels — ширина UNet-декодера, по умолчанию smp (256,128,64,32,16); узкий (128,64,32,16,8) вдвое дешевле по FLOPs."""
     aux = dict(classes=1, pooling='avg', dropout=0.2) if aux_head else None
-    return smp.Unet(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None, aux_params=aux)
+    kw = dict(decoder_channels=tuple(decoder_channels)) if decoder_channels else {}
+    return smp.Unet(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None, aux_params=aux, **kw)
+
+
+def parse_decoder(v):
+    """'128,64,32,16,8' → (128,64,32,16,8); None/'' → None (smp default)."""
+    if not v:
+        return None
+    return tuple(int(x) for x in str(v).replace(' ', '').split(','))
 
 
 def forward(model, x):
@@ -294,7 +303,9 @@ def main():
     ap.add_argument('--run-name', required=True)
     ap.add_argument('--version', default='v1')
     ap.add_argument('--encoder', default='resnet34')
-    ap.add_argument('--img-size', type=int, default=256)
+    ap.add_argument('--img-size', default='256', help='сторона квадрата или WxH, кратно 32 (например 1024x768)')
+    ap.add_argument('--decoder-channels', default=None, help='ширина UNet-декодера через запятую, например 128,64,32,16,8 (по умолчанию smp 256,...,16)')
+    ap.add_argument('--val-limit', type=int, default=0, help='отладка: ограничить число val-tune строк (proxy-строки сохраняются)')
     ap.add_argument('--epochs', type=int, default=15)
     ap.add_argument('--batch-size', type=int, default=32, help='на одну GPU')
     ap.add_argument('--lr', type=float, default=1e-4)
@@ -317,6 +328,8 @@ def main():
     ap.add_argument('--no-wandb', dest='wandb', action='store_false')
     ap.add_argument('--wandb-project', default='aic2026-detective')
     args = ap.parse_args()
+    args.img_size = parse_size(args.img_size)          # (w, h)
+    args.decoder_channels = parse_decoder(args.decoder_channels)
 
     rank, world, local_rank = ddp_setup()
     main_proc = rank == 0
@@ -357,6 +370,9 @@ def main():
     if args.limit:
         df_train = df_train.sample(n=args.limit, random_state=args.seed).reset_index(drop=True)
     df_val = load_split(args.version, 'val-tune')
+    if args.val_limit:
+        keep = df_val[df_val['in_proxy'] == 1].index.tolist()[:args.val_limit]
+        df_val = df_val.loc[keep].reset_index(drop=True)
     df_proxy = df_val[df_val['in_proxy'] == 1].reset_index(drop=True)
     # фиксированная панель картинок: 4 позитива, 2 neg_train, 2 neg_src из proxy
     rng = np.random.RandomState(args.seed)
@@ -377,7 +393,7 @@ def main():
         dl_val = DataLoader(SegDataset(df_val, args.img_size, train=False), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
 
-    model = build_model(args.encoder, weights=None if ckpt else 'imagenet', aux_head=args.aux_head).to(device)
+    model = build_model(args.encoder, weights=None if ckpt else 'imagenet', aux_head=args.aux_head, decoder_channels=args.decoder_channels).to(device)
     cls_criterion = nn.BCEWithLogitsLoss()
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -480,7 +496,8 @@ def main():
                 best['proxy'] = pm['aic']; best_epoch['proxy'] = epoch
             if fm and fm['aic'] > best['full']:
                 best['full'] = fm['aic']; best_epoch['full'] = epoch
-            weights = dict(epoch=epoch, model=model.state_dict(), encoder=args.encoder, img_size=args.img_size, aux_head=args.aux_head, metrics=rec)
+            weights = dict(epoch=epoch, model=model.state_dict(), encoder=args.encoder, img_size=list(args.img_size), aux_head=args.aux_head,
+                           decoder_channels=list(args.decoder_channels) if args.decoder_channels else None, metrics=rec)
             for crit in ('loss', 'proxy', 'full'):
                 if best_epoch[crit] == epoch:
                     torch.save(weights, run_dir / f'best_{crit}.pth')

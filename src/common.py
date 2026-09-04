@@ -91,6 +91,17 @@ def normalize(img_uint8: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(x.transpose(2, 0, 1))
 
 
+def parse_size(v) -> tuple[int, int]:
+    """'1024x768' | '640' | (w, h) | [w, h] → (w, h). Стороны должны делиться на 32 (UNet)."""
+    if isinstance(v, (tuple, list)):
+        w, h = int(v[0]), int(v[1])
+    else:
+        s = str(v).lower().replace('×', 'x')
+        w, h = (int(s.split('x')[0]), int(s.split('x')[1])) if 'x' in s else (int(s), int(s))
+    assert w % 32 == 0 and h % 32 == 0, f'размер {w}x{h} должен делиться на 32'
+    return w, h
+
+
 def save_binary_png(mask_bool: np.ndarray, path: str | Path) -> None:
     Image.fromarray((mask_bool.astype(np.uint8) * 255), mode='L').save(path)
 

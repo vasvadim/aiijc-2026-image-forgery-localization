@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from common import data_dir, load_gt, load_rgb, normalize
+from common import data_dir, load_gt, load_rgb, normalize, parse_size
 
 cv2.setNumThreads(0)
 
@@ -20,9 +20,9 @@ class SegDataset(Dataset):
     """rows: DataFrame split-а (chng_img_path, gt_path, is_neg, neg_pool, in_proxy, H, W).
     Для строк без gt_path (neg_src / neg_nb / тест) маска нулевая."""
 
-    def __init__(self, df, img_size: int, train: bool, root=None, path_col: str = 'chng_img_path'):
+    def __init__(self, df, img_size, train: bool, root=None, path_col: str = 'chng_img_path'):
         self.df = df.reset_index(drop=True)
-        self.img_size = img_size
+        self.img_size = parse_size(img_size)   # (w, h)
         self.train = train
         self.root = root or data_dir()
         self.path_col = path_col
@@ -35,14 +35,14 @@ class SegDataset(Dataset):
         r = self.df.iloc[idx]
         img = load_rgb(self.root / r[self.path_col])
         h, w = img.shape[:2]
-        s = self.img_size
-        img = cv2.resize(img, (s, s), interpolation=cv2.INTER_LINEAR)
+        sw, sh = self.img_size
+        img = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_LINEAR)
         gt_path = r.get('gt_path', '')
         if gt_path:
             m = load_gt(self.root / gt_path).astype(np.uint8)
-            m = cv2.resize(m, (s, s), interpolation=cv2.INTER_NEAREST)
+            m = cv2.resize(m, (sw, sh), interpolation=cv2.INTER_NEAREST)
         else:
-            m = np.zeros((s, s), np.uint8)
+            m = np.zeros((sh, sw), np.uint8)
         if self.train and self.rng.random() < 0.5:
             img = np.ascontiguousarray(img[:, ::-1])
             m = np.ascontiguousarray(m[:, ::-1])

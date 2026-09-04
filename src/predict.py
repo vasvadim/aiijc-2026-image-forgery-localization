@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import data_dir, load_split, load_test_df, save_binary_png, split_path, wandb_update_summary  # noqa: E402
+from common import data_dir, load_split, load_test_df, parse_size, save_binary_png, split_path, wandb_update_summary  # noqa: E402
 from data import SegDataset  # noqa: E402
 
 cv2.setNumThreads(0)
@@ -102,7 +102,7 @@ def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float
 def load_model(ckpt_path: str, device):
     from train import build_model
     ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    model = build_model(ck['encoder'], weights=None, aux_head=bool(ck.get('aux_head', False)))
+    model = build_model(ck['encoder'], weights=None, aux_head=bool(ck.get('aux_head', False)), decoder_channels=ck.get('decoder_channels'))
     model.load_state_dict(ck['model'])
     return model.to(device), ck
 
@@ -117,7 +117,7 @@ def main():
     ap.add_argument('--t', type=float, default=0.5)
     ap.add_argument('--a-min', type=float, default=0.0)
     ap.add_argument('--tau', type=float, default=0.0, help='порог image-level головы: p_img < tau → пустая маска (0 — без гейтинга)')
-    ap.add_argument('--img-size', type=int, default=None, help='по умолчанию из чекпоинта')
+    ap.add_argument('--img-size', default=None, help='WxH или сторона; по умолчанию из чекпоинта')
     ap.add_argument('--batch-size', type=int, default=32)
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--amp', action='store_true')
@@ -129,7 +129,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model, ck = load_model(args.checkpoint, device)
-    img_size = args.img_size or ck['img_size']
+    img_size = parse_size(args.img_size or ck['img_size'])
     out = Path(args.out)
 
     if args.test:

@@ -22,9 +22,11 @@ from torch.utils.flop_counter import FlopCounterMode
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-def measure(model, img_size: int, iters: int, device) -> dict:
+def measure(model, img_size, iters: int, device) -> dict:
+    from common import parse_size
+    w, h = parse_size(img_size)
     model.eval()
-    x = torch.randn(1, 3, img_size, img_size, device=device)
+    x = torch.randn(1, 3, h, w, device=device)
     with torch.no_grad():
         fc = FlopCounterMode(display=False)
         with fc:
@@ -38,14 +40,15 @@ def measure(model, img_size: int, iters: int, device) -> dict:
             model(x)
         torch.cuda.synchronize()
         ms = (time.perf_counter() - t0) / iters * 1000
-    return dict(img_size=img_size, gflops=flops / 1e9, latency_ms=ms, device=torch.cuda.get_device_name(0))
+    return dict(img_size=[w, h], gflops=flops / 1e9, latency_ms=ms, device=torch.cuda.get_device_name(0))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint')
     ap.add_argument('--encoder', default='resnet34')
-    ap.add_argument('--img-size', type=int, default=None)
+    ap.add_argument('--img-size', default=None, help='WxH или сторона')
+    ap.add_argument('--decoder-channels', default=None)
     ap.add_argument('--iters', type=int, default=100)
     ap.add_argument('--out')
     args = ap.parse_args()
@@ -55,8 +58,8 @@ def main():
         model, ck = load_model(args.checkpoint, device)
         size = args.img_size or ck['img_size']
     else:
-        from train import build_model
-        model = build_model(args.encoder, weights=None).to(device)
+        from train import build_model, parse_decoder
+        model = build_model(args.encoder, weights=None, aux_head=True, decoder_channels=parse_decoder(args.decoder_channels)).to(device)
         size = args.img_size or 256
     res = measure(model, size, args.iters, device)
     print(f'{res["device"]}: img_size={size}  GFLOPs={res["gflops"]:.2f} (limit 100)  latency={res["latency_ms"]:.2f} ms (limit 50, H100 быстрее A4000 ~×3)')
