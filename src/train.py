@@ -83,8 +83,16 @@ def all_reduce_mean(x: float, device) -> float:
 
 
 # ----------------------------------------------------------------------------- model / loss
-def build_model(encoder: str, weights: str | None = 'imagenet') -> nn.Module:
-    return smp.Unet(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None)
+def build_model(encoder: str, weights: str | None = 'imagenet', aux_head: bool = False) -> nn.Module:
+    """UNet; с aux_head=True возвращает (mask_logits, img_logit) — image-level голова «есть ли правка»."""
+    aux = dict(classes=1, pooling='avg', dropout=0.2) if aux_head else None
+    return smp.Unet(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None, aux_params=aux)
+
+
+def forward(model, x):
+    """Единый вызов: (mask_logits, img_logit | None)."""
+    out = model(x)
+    return (out[0], out[1]) if isinstance(out, (tuple, list)) else (out, None)
 
 
 class BceDiceLoss(nn.Module):
@@ -110,11 +118,19 @@ def make_loss(name: str) -> nn.Module:
 
 
 # ----------------------------------------------------------------------------- validation
-def proxy_metrics(dice, area, df_proxy: pd.DataFrame) -> dict:
+def proxy_metrics(dice, area, df_proxy: pd.DataFrame, img_prob=None, tau: float = 0.5) -> dict:
     """Dice per image по позитивам (is_neg==0), FPR по пулам среди негативов (как metric.aggregate, но на
     тензорах) + разрезы по доменам и площади GT, доля пустых прогнозов, медиана площади на негативах."""
     d = np.asarray(dice); a = np.asarray(area)
     pos = df_proxy['is_neg'].values == 0
+    cls = None
+    if img_prob is not None:  # гейтинг: p_img < tau → маска пустая (Dice=0 на позитиве, не FA на негативе)
+        ip = np.asarray(img_prob)
+        keep = ip >= tau
+        cls = dict(acc=float(((ip >= 0.5) == pos).mean()), tpr=float((ip[pos] >= tau).mean()) if pos.any() else float('nan'),
+                   tnr=float((ip[~pos] < tau).mean()) if (~pos).any() else float('nan'))
+        d_ung, a_ung = d, a
+        d = d * keep; a = a * keep
     dice_pos = float(d[pos].mean()) if pos.any() else float('nan')
     fpr = {}
     for pool in df_proxy.loc[~pos, 'neg_pool'].unique():
@@ -133,6 +149,10 @@ def proxy_metrics(dice, area, df_proxy: pd.DataFrame) -> dict:
     for lo, hi, name in AREA_BUCKETS:
         sel = pos & (ga >= lo) & (ga < hi)
         out['dice_by_area'][name] = float(d[sel].mean()) if sel.any() else float('nan')
+    if cls is not None:
+        out['cls'] = cls
+        ung = proxy_metrics(d_ung, a_ung, df_proxy)
+        out['aic_ungated'] = ung['aic']; out['dice_pos_ungated'] = ung['dice_pos']; out['fpr_main_ungated'] = ung['fpr_main']
     return out
 
 
@@ -162,12 +182,12 @@ def validate(model, loader, criterion, device, df_val: pd.DataFrame, amp: bool, 
     """Один проход по val-tune: val loss на всех строках + proxy-метрики на in_proxy==1 + панель картинок."""
     model.eval()
     total, n = 0.0, 0
-    prox_idx, prox_dice, prox_area, panel = [], [], [], {}
+    prox_idx, prox_dice, prox_area, prox_img, panel = [], [], [], [], {}
     for batch in tqdm(loader, desc='val', leave=False, disable=None):
         x = batch['image'].to(device, non_blocking=True)
         y = batch['mask'].to(device, non_blocking=True)
         with torch.autocast('cuda', enabled=amp):
-            logits = model(x)
+            logits, img_logit = forward(model, x)
         total += criterion(logits.float(), y).item() * x.shape[0]
         n += x.shape[0]
         idx = batch['idx'].numpy()
@@ -180,12 +200,15 @@ def validate(model, loader, criterion, device, df_val: pd.DataFrame, amp: bool, 
             dice = (2 * inter / (p.sum(dim=(1, 2, 3)) + g.sum(dim=(1, 2, 3)) + 1e-6)).cpu().numpy()
             area = p.float().mean(dim=(1, 2, 3)).cpu().numpy()
             prox_idx.extend(idx[inp].tolist()); prox_dice.extend(dice.tolist()); prox_area.extend(area.tolist())
+            if img_logit is not None:
+                prox_img.extend(torch.sigmoid(img_logit.float())[inp, 0].cpu().numpy().tolist())
             for j in np.where(inp)[0]:
                 if int(idx[j]) in img_idx:
                     panel[int(idx[j])] = (_denorm(x[j]), (y[j, 0] > 0.5).cpu().numpy(), (prob[j, 0] > 0.5).cpu().numpy())
     order = np.argsort(prox_idx)
     df_proxy = df_val.iloc[np.array(prox_idx)[order]]
-    pm = proxy_metrics(np.array(prox_dice)[order], np.array(prox_area)[order], df_proxy)
+    pm = proxy_metrics(np.array(prox_dice)[order], np.array(prox_area)[order], df_proxy,
+                       img_prob=np.array(prox_img)[order] if prox_img else None)
     return total / max(n, 1), pm, panel
 
 
@@ -193,7 +216,7 @@ def full_metric(model, df_proxy, args, device, run_dir: Path, epoch: int) -> dic
     """Официальная метрика на PNG (t=0.5, a_min=0) на proxy-строках; PNG удаляются после подсчёта."""
     from metric import evaluate
     out = run_dir / f'full_ep{epoch:02d}'
-    predict_to_files(model, df_proxy, out, img_size=args.img_size, t=0.5, a_min=0.0,
+    predict_to_files(model, df_proxy, out, img_size=args.img_size, t=0.5, a_min=0.0, tau=0.5 if args.aux_head else 0.0,
                      batch_size=args.batch_size, workers=args.workers, device=device, amp=args.amp,
                      root=data_dir(), path_col='chng_img_path', save_probs=False)
     res = evaluate(str(out / 'submission.csv'), str(args.split_file), 'proxy', str(data_dir()), workers=args.workers)
@@ -276,6 +299,9 @@ def main():
     ap.add_argument('--batch-size', type=int, default=32, help='на одну GPU')
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--loss', default='bce', choices=['bce', 'bce_dice'])
+    ap.add_argument('--aux-head', action='store_true', help='image-level голова «есть ли правка» (smp aux_params), гейтинг при инференсе')
+    ap.add_argument('--cls-weight', type=float, default=0.5, help='вес BCE image-level головы в общем loss')
+    ap.add_argument('--neg-src', type=int, default=0, help='сколько src-оригиналов train-сцен добавить в обучение как негативы (0 — не добавлять)')
     ap.add_argument('--scheduler', default='none', choices=['none', 'cosine'])
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--workers', type=int, default=8, help='DataLoader-воркеров на процесс')
@@ -318,6 +344,16 @@ def main():
         (run_dir / 'config.json').write_text(json.dumps(config, indent=2, ensure_ascii=False, default=str))
 
     df_train = load_split(args.version, 'train')
+    if args.neg_src:
+        src = df_train.loc[df_train['orgl_img_path'] != '', ['orgl_img_path', 'domain', 'group_id', 'fold', 'role', 'H', 'W']].drop_duplicates('orgl_img_path')
+        src = src.sample(n=min(args.neg_src, len(src)), random_state=args.seed)
+        neg = pd.DataFrame(dict(chng_img_path=src['orgl_img_path'].values, gt_path='', orgl_img_path='', domain=src['domain'].values,
+                                generator='none', group_id=src['group_id'].values, fold=src['fold'].values, role='train', is_neg=1,
+                                neg_pool='neg_src_train', in_proxy=0, H=src['H'].values, W=src['W'].values, gt_area=0.0))
+        df_train = pd.concat([df_train, neg], ignore_index=True)
+        if main_proc:
+            print(f'neg-src: добавлено {len(neg)} оригиналов train-сцен как негативы; негативов в train теперь '
+                  f'{int((df_train["is_neg"] == 1).sum())} / {len(df_train)}', flush=True)
     if args.limit:
         df_train = df_train.sample(n=args.limit, random_state=args.seed).reset_index(drop=True)
     df_val = load_split(args.version, 'val-tune')
@@ -341,7 +377,8 @@ def main():
         dl_val = DataLoader(SegDataset(df_val, args.img_size, train=False), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
 
-    model = build_model(args.encoder, weights=None if ckpt else 'imagenet').to(device)
+    model = build_model(args.encoder, weights=None if ckpt else 'imagenet', aux_head=args.aux_head).to(device)
+    cls_criterion = nn.BCEWithLogitsLoss()
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     ddp_model = DDP(model, device_ids=[local_rank]) if world > 1 else model
@@ -399,8 +436,10 @@ def main():
                 x = x.to(memory_format=torch.channels_last)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('cuda', enabled=args.amp):
-                logits = ddp_model(x)
+                logits, img_logit = forward(ddp_model, x)
             loss = criterion(logits.float(), y)
+            if img_logit is not None:
+                loss = loss + args.cls_weight * cls_criterion(img_logit.float(), batch['label'].to(device))
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             gn = torch.nn.utils.clip_grad_norm_(params, max_norm=1e9).item()   # только измеряем, не режем
@@ -431,6 +470,7 @@ def main():
             log_f.write(json.dumps(rec, ensure_ascii=False) + '\n'); log_f.flush()
             print(f'ep{epoch} train={tr_loss:.4f} val={va_loss:.4f} | proxy dice={pm["dice_pos"]:.4f} '
                   f'fpr={pm["fpr_main"]:.4f} aic={pm["aic"]:.4f}'
+                  + (f' (ungated {pm["aic_ungated"]:.4f}; cls acc={pm["cls"]["acc"]:.3f} tpr={pm["cls"]["tpr"]:.3f} tnr={pm["cls"]["tnr"]:.3f})' if 'cls' in pm else '')
                   + (f' | full dice={fm["dice_pos"]:.4f} fpr={fm["fpr_main"]:.4f} aic={fm["aic"]:.4f}' if fm else '')
                   + f' | lr={lr_now:.2e} gn={rec["grad_norm"]:.2f} mem={rec["gpu_max_mem_gb"]}G | {rec["time_s"]}s (train {rec["train_time_s"]}s)', flush=True)
 
@@ -440,7 +480,7 @@ def main():
                 best['proxy'] = pm['aic']; best_epoch['proxy'] = epoch
             if fm and fm['aic'] > best['full']:
                 best['full'] = fm['aic']; best_epoch['full'] = epoch
-            weights = dict(epoch=epoch, model=model.state_dict(), encoder=args.encoder, img_size=args.img_size, metrics=rec)
+            weights = dict(epoch=epoch, model=model.state_dict(), encoder=args.encoder, img_size=args.img_size, aux_head=args.aux_head, metrics=rec)
             for crit in ('loss', 'proxy', 'full'):
                 if best_epoch[crit] == epoch:
                     torch.save(weights, run_dir / f'best_{crit}.pth')
@@ -461,6 +501,9 @@ def main():
                 d.update({f'proxy/fpr_{k}': v for k, v in pm['fpr'].items()})
                 d.update({f'proxy/dice_domain_{k}': v for k, v in pm['dice_by_domain'].items()})
                 d.update({f'proxy/dice_area_{k}': v for k, v in pm['dice_by_area'].items()})
+                if 'cls' in pm:
+                    d.update({'proxy/aic_ungated': pm['aic_ungated'], 'proxy/dice_pos_ungated': pm['dice_pos_ungated'],
+                              'proxy/fpr_main_ungated': pm['fpr_main_ungated'], 'cls/acc': pm['cls']['acc'], 'cls/tpr': pm['cls']['tpr'], 'cls/tnr': pm['cls']['tnr']})
                 if fm:
                     d.update({'full/dice_pos': fm['dice_pos'], 'full/fpr_main': fm['fpr_main'], 'full/aic': fm['aic']})
                     d.update({f'full/fpr_{k}': v for k, v in fm['fpr'].items()})

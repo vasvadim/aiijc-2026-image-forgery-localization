@@ -35,7 +35,10 @@ from data import SegDataset  # noqa: E402
 cv2.setNumThreads(0)
 
 
-def postprocess(prob: np.ndarray, t: float, a_min: float) -> np.ndarray:
+def postprocess(prob: np.ndarray, t: float, a_min: float, img_prob: float | None = None, tau: float = 0.0) -> np.ndarray:
+    """Бинаризация t; обнуление при площади < a_min; гейтинг image-level головой при p_img < tau."""
+    if img_prob is not None and tau > 0 and img_prob < tau:
+        return np.zeros(prob.shape, bool)
     pred = prob >= t
     if a_min > 0 and pred.mean() < a_min:
         pred[:] = False
@@ -43,17 +46,19 @@ def postprocess(prob: np.ndarray, t: float, a_min: float) -> np.ndarray:
 
 
 def _write(args):
-    prob, h, w, t, a_min, pred_path, prob_path = args
+    prob, h, w, t, a_min, pred_path, prob_path, img_prob, tau = args
     prob = cv2.resize(prob, (w, h), interpolation=cv2.INTER_LINEAR)
-    save_binary_png(postprocess(prob, t, a_min), pred_path)
+    save_binary_png(postprocess(prob, t, a_min, img_prob, tau), pred_path)
     if prob_path:
         cv2.imwrite(str(prob_path), np.clip(prob * 255 + 0.5, 0, 255).astype(np.uint8))
 
 
 @torch.no_grad()
 def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float, batch_size: int, workers: int,
-                     device, amp: bool, root: Path, path_col: str, save_probs: bool) -> Path:
-    """Пишет <out>/predictions/<stem>_pred.png, <out>/submission.csv (img_path = df[path_col])."""
+                     device, amp: bool, root: Path, path_col: str, save_probs: bool, tau: float = 0.0) -> Path:
+    """Пишет <out>/predictions/<stem>_pred.png, <out>/submission.csv (img_path = df[path_col]);
+    если у модели есть image-level голова — ещё <out>/img_probs.csv (stem, p_img) и гейтинг по tau."""
+    from train import forward
     out = Path(out)
     pred_dir = out / 'predictions'
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -63,24 +68,31 @@ def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float
     ds = SegDataset(df, img_size, train=False, root=root, path_col=path_col)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=workers, pin_memory=True)
     model.eval()
-    rows = []
+    rows, img_rows = [], []
     with ThreadPoolExecutor(max_workers=max(4, workers)) as ex:
         futs = []
         for batch in tqdm(dl, desc='predict', leave=False, disable=None):
             x = batch['image'].to(device, non_blocking=True)
             with torch.autocast('cuda', enabled=amp):
-                logits = model(x)
+                logits, img_logit = forward(model, x)
             probs = torch.sigmoid(logits.float())[:, 0].cpu().numpy()
+            img_probs = torch.sigmoid(img_logit.float())[:, 0].cpu().numpy() if img_logit is not None else None
             for i in range(probs.shape[0]):
                 idx = int(batch['idx'][i]); h = int(batch['orig_h'][i]); w = int(batch['orig_w'][i])
                 rel = df[path_col].iloc[idx]
                 stem = Path(rel).stem
                 pred_path = pred_dir / f'{stem}_pred.png'
                 prob_path = (prob_dir / f'{stem}.png') if save_probs else None
-                futs.append(ex.submit(_write, (probs[i], h, w, t, a_min, pred_path, prob_path)))
+                ip = float(img_probs[i]) if img_probs is not None else None
+                futs.append(ex.submit(_write, (probs[i], h, w, t, a_min, pred_path, prob_path, ip, tau)))
                 rows.append({'img_path': rel, 'prediction_path': f'predictions/{stem}_pred.png'})
+                if ip is not None:
+                    img_rows.append({'stem': stem, 'img_path': rel, 'p_img': f'{ip:.6f}'})
         for f in futs:
             f.result()
+    if img_rows:
+        with open(out / 'img_probs.csv', 'w', newline='', encoding='utf-8') as f:
+            wr = csv.DictWriter(f, fieldnames=['stem', 'img_path', 'p_img']); wr.writeheader(); wr.writerows(img_rows)
     with open(out / 'submission.csv', 'w', newline='', encoding='utf-8') as f:
         wr = csv.DictWriter(f, fieldnames=['img_path', 'prediction_path'])
         wr.writeheader(); wr.writerows(rows)
@@ -90,7 +102,7 @@ def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float
 def load_model(ckpt_path: str, device):
     from train import build_model
     ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    model = build_model(ck['encoder'], weights=None)
+    model = build_model(ck['encoder'], weights=None, aux_head=bool(ck.get('aux_head', False)))
     model.load_state_dict(ck['model'])
     return model.to(device), ck
 
@@ -104,6 +116,7 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--t', type=float, default=0.5)
     ap.add_argument('--a-min', type=float, default=0.0)
+    ap.add_argument('--tau', type=float, default=0.0, help='порог image-level головы: p_img < tau → пустая маска (0 — без гейтинга)')
     ap.add_argument('--img-size', type=int, default=None, help='по умолчанию из чекпоинта')
     ap.add_argument('--batch-size', type=int, default=32)
     ap.add_argument('--workers', type=int, default=8)
@@ -133,9 +146,9 @@ def main():
         root, path_col = data_dir(), 'chng_img_path'
 
     sub = predict_to_files(model, df, out, img_size, args.t, args.a_min, args.batch_size, args.workers,
-                           device, args.amp, root, path_col, args.save_probs)
-    print(f'written {sub} ({len(df)} rows), t={args.t} a_min={args.a_min}')
-    info = dict(checkpoint=args.checkpoint, epoch=ck.get('epoch'), t=args.t, a_min=args.a_min, img_size=img_size,
+                           device, args.amp, root, path_col, args.save_probs, tau=args.tau)
+    print(f'written {sub} ({len(df)} rows), t={args.t} a_min={args.a_min} tau={args.tau}')
+    info = dict(checkpoint=args.checkpoint, epoch=ck.get('epoch'), t=args.t, a_min=args.a_min, tau=args.tau, img_size=img_size,
                 role=args.role or 'test', n=len(df))
     if split_file is not None:
         from metric import evaluate, format_report
@@ -146,7 +159,7 @@ def main():
         if (run_dir / 'wandb_id.txt').exists() and args.role in ('val-report', 'val-tune', 'control'):
             m = res['main']
             wandb_update_summary(run_dir, {f'{args.role}/aic': m['aic_main'], f'{args.role}/dice_pos': m['dice_pos'],
-                                           f'{args.role}/fpr_main': m['fpr_main'], f'{args.role}/t': args.t, f'{args.role}/a_min': args.a_min,
+                                           f'{args.role}/fpr_main': m['fpr_main'], f'{args.role}/t': args.t, f'{args.role}/a_min': args.a_min, f'{args.role}/tau': args.tau,
                                            **{f'{args.role}/fpr_{k}': v[0] for k, v in m['fpr'].items()}})
     (out / 'metrics.json').write_text(json.dumps(info, indent=1, ensure_ascii=False), encoding='utf-8')
     if args.zip:

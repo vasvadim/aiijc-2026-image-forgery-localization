@@ -17,6 +17,7 @@ from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -25,6 +26,7 @@ from metric import FA_AREA, MAIN_POOLS, aic, select_plateau  # noqa: E402
 
 T_GRID = np.round(np.arange(0.10, 0.96, 0.05), 2)
 AMIN_GRID = np.array([0.0, 0.002, 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.10])
+TAU_GRID = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])   # порог image-level головы (0 = без гейтинга)
 
 
 def _one(args):
@@ -60,33 +62,57 @@ def main():
     is_pos = np.array([r[0] for r in res]); pools = np.array([r[1] for r in res])
     D = np.stack([r[2] for r in res]); A = np.stack([r[3] for r in res])       # [n, T]
 
-    grid = np.zeros((len(T_GRID), len(AMIN_GRID)))
-    detail = {}
-    for j, a_min in enumerate(AMIN_GRID):
-        keep = A >= a_min if a_min > 0 else np.ones_like(A, bool)               # маска не обнулена
-        dice_pos = (D[is_pos] * keep[is_pos]).mean(axis=0)                       # [T]
-        fa = (A >= FA_AREA) & keep
-        fprs = {str(p): fa[(~is_pos) & (pools == p)].mean(axis=0) for p in np.unique(pools[~is_pos])}
-        main = [fprs[p] for p in MAIN_POOLS if p in fprs]
-        fpr_main = np.mean(main, axis=0) if main else np.zeros(len(T_GRID))
-        for i in range(len(T_GRID)):
-            grid[i, j] = aic(float(dice_pos[i]), float(fpr_main[i]))
-            detail[(i, j)] = dict(dice_pos=float(dice_pos[i]), fpr_main=float(fpr_main[i]),
-                                  fpr={p: float(v[i]) for p, v in fprs.items()})
-    i, j = select_plateau(grid, tol=args.tol)
+    # image-level вероятности (если у модели есть голова): <out>/img_probs.csv рядом с probs/
+    ip_csv = Path(args.probs_dir).parent / 'img_probs.csv'
+    taus = [0.0]
+    img_prob = None
+    if ip_csv.exists():
+        ipd = pd.read_csv(ip_csv, dtype=str)
+        m = dict(zip(ipd['stem'], ipd['p_img'].astype(float)))
+        img_prob = np.array([m.get(Path(r['chng_img_path']).stem, 1.0) for r in df.to_dict('records')])
+        taus = TAU_GRID.tolist()
+        print(f'image-level head: {ip_csv} ({len(m)} rows) -> сетка t x a_min x tau')
+
+    def grid_for(tau: float):
+        keep_img = (img_prob >= tau) if (img_prob is not None and tau > 0) else np.ones(len(df), bool)
+        grid = np.zeros((len(T_GRID), len(AMIN_GRID))); detail = {}
+        for j, a_min in enumerate(AMIN_GRID):
+            keep = (A >= a_min if a_min > 0 else np.ones_like(A, bool)) & keep_img[:, None]   # маска не обнулена
+            dice_pos = (D[is_pos] * keep[is_pos]).mean(axis=0)                                 # [T]
+            fa = (A >= FA_AREA) & keep
+            fprs = {str(p): fa[(~is_pos) & (pools == p)].mean(axis=0) for p in np.unique(pools[~is_pos])}
+            main = [fprs[p] for p in MAIN_POOLS if p in fprs]
+            fpr_main = np.mean(main, axis=0) if main else np.zeros(len(T_GRID))
+            for i in range(len(T_GRID)):
+                grid[i, j] = aic(float(dice_pos[i]), float(fpr_main[i]))
+                detail[(i, j)] = dict(dice_pos=float(dice_pos[i]), fpr_main=float(fpr_main[i]),
+                                      fpr={p: float(v[i]) for p, v in fprs.items()})
+        return grid, detail
+
+    best = None
+    per_tau = {}
+    for tau in taus:
+        grid, detail = grid_for(tau)
+        i, j = select_plateau(grid, tol=args.tol)
+        per_tau[str(tau)] = dict(t=float(T_GRID[i]), a_min=float(AMIN_GRID[j]), aic=float(grid[i, j]), argmax=float(grid.max()))
+        if best is None or grid[i, j] > best['aic']:
+            best = dict(tau=float(tau), i=i, j=j, grid=grid, detail=detail, aic=float(grid[i, j]))
+    tau, i, j, grid, detail = best['tau'], best['i'], best['j'], best['grid'], best['detail']
     imax = np.unravel_index(int(np.argmax(grid)), grid.shape)
-    chosen = dict(t=float(T_GRID[i]), a_min=float(AMIN_GRID[j]), aic=float(grid[i, j]), **detail[(i, j)],
-                  argmax=dict(t=float(T_GRID[imax[0]]), a_min=float(AMIN_GRID[imax[1]]), aic=float(grid.max())),
-                  tol=args.tol, role=args.role, version=args.version, n=len(df),
+    chosen = dict(t=float(T_GRID[i]), a_min=float(AMIN_GRID[j]), tau=tau, aic=float(grid[i, j]), **detail[(i, j)],
+                  argmax=dict(t=float(T_GRID[imax[0]]), a_min=float(AMIN_GRID[imax[1]]), tau=tau, aic=float(grid.max())),
+                  per_tau=per_tau, tol=args.tol, role=args.role, version=args.version, n=len(df),
                   t_grid=T_GRID.tolist(), amin_grid=AMIN_GRID.tolist(), grid=grid.round(5).tolist())
     Path(args.out).write_text(json.dumps(chosen, indent=1), encoding='utf-8')
 
-    print('AIC grid (rows t, cols a_min):')
+    if len(taus) > 1:
+        print('per tau (plateau center): ' + '  '.join(f'tau={k}: {v["aic"]:.4f}@t={v["t"]}/a={v["a_min"]}' for k, v in per_tau.items()))
+    print(f'AIC grid (rows t, cols a_min), tau={tau}:')
     print('   t  | ' + ' '.join(f'{a:6.3f}' for a in AMIN_GRID))
     for ii, t in enumerate(T_GRID):
         mark = '*' if ii == i else ' '
         print(f'{mark}{t:.2f} | ' + ' '.join(f'{v:6.4f}' for v in grid[ii]))
-    print(f'chosen (plateau center): t={chosen["t"]} a_min={chosen["a_min"]} AIC={chosen["aic"]:.4f} '
+    print(f'chosen (plateau center): t={chosen["t"]} a_min={chosen["a_min"]} tau={chosen["tau"]} AIC={chosen["aic"]:.4f} '
           f'dice={chosen["dice_pos"]:.4f} fpr_main={chosen["fpr_main"]:.4f} fpr={chosen["fpr"]}')
     print(f'argmax: {chosen["argmax"]}')
     if i in (0, len(T_GRID) - 1) or j in (0, len(AMIN_GRID) - 1):
@@ -96,7 +122,7 @@ def main():
     if (run_dir / 'wandb_id.txt').exists():
         wandb_update_summary(run_dir, {'threshold/t': chosen['t'], 'threshold/a_min': chosen['a_min'],
                                        'threshold/val_tune_aic': chosen['aic'], 'threshold/val_tune_dice': chosen['dice_pos'],
-                                       'threshold/val_tune_fpr_main': chosen['fpr_main'], 'threshold/grid': grid.round(4).tolist()})
+                                       'threshold/val_tune_fpr_main': chosen['fpr_main'], 'threshold/tau': chosen['tau'], 'threshold/grid': grid.round(4).tolist()})
 
 
 if __name__ == '__main__':

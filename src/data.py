@@ -46,9 +46,11 @@ class SegDataset(Dataset):
         if self.train and self.rng.random() < 0.5:
             img = np.ascontiguousarray(img[:, ::-1])
             m = np.ascontiguousarray(m[:, ::-1])
+        is_neg = int(r.get('is_neg', 1 if not gt_path else 0))
         return {
             'image': torch.from_numpy(normalize(img)),
             'mask': torch.from_numpy(m.astype(np.float32)).unsqueeze(0),
+            'label': torch.tensor([0.0 if is_neg else 1.0]),   # image-level: есть ли манипуляция
             'idx': idx,
             'orig_h': h,
             'orig_w': w,

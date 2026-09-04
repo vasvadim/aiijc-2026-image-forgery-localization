@@ -38,6 +38,13 @@ CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node 2 src/train.py --run-name <и
 `last.pth`, `best_loss.pth`, `best_proxy.pth`, `best_full.pth`, `best.pth` (= по `--select-by`).
 Флаги: `--loss bce|bce_dice`, `--scheduler none|cosine`, `--limit N` (отладка), `--full-every 0` (без full),
 `--patience 5` — стоп, если критерий `--select-by` не улучшался 5 эпох подряд (D-12; 0 = выключить).
+`--aux-head` — image-level голова «есть ли правка» (smp `aux_params`, avg-pool + dropout); loss += `--cls-weight`·BCE.
+С головой proxy-AIC считается **с гейтингом** при τ=0.5 (p_img < τ → пустая маска), рядом логируется ungated
+и качество классификатора (`cls/acc`, `cls/tpr`, `cls/tnr`). `--neg-src N` — добавить N src-оригиналов
+train-сцен как чистые примеры (маска пустая, label 0); holdout-сцены не задействованы (group-split).
+`predict.py --tau τ` применяет гейтинг и пишет `img_probs.csv`; `tune_threshold.py` при наличии `img_probs.csv`
+перебирает t × a_min × τ и пишет `tau` в `threshold.json`. `--rebuild-scheduler` — при resume построить
+cosine заново на `--epochs` (нужно, если горизонт изменился).
 
 **Продолжение прерванного обучения.** `last.pth` хранит полное состояние (веса, Adam с моментами,
 scheduler, GradScaler, эпоха, best, RNG, id W&B-рана). Та же команда + `--resume auto` продолжает
