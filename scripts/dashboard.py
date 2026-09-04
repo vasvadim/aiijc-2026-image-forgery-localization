@@ -79,7 +79,7 @@ tr.best td{font-weight:600;color:var(--accent)}
 <script id="data" type="application/json">__DATA__</script>
 <script>
 const DATA = JSON.parse(document.getElementById('data').textContent);
-const M = DATA.main, R = DATA.ref, E = M.epochs, RE = R ? R.epochs : [];
+const M = DATA.main, REFS = DATA.refs || [], R = REFS[0] || null, E = M.epochs, RE = R ? R.epochs : [];
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const f4 = x => (x==null||Number.isNaN(x)) ? '—' : (+x).toFixed(4);
 const f3 = x => (x==null||Number.isNaN(x)) ? '—' : (+x).toFixed(3);
@@ -103,7 +103,8 @@ const tiles = [
   ['FPR_main (лучшая эп.)', f4(best.proxy.fpr_main), `train ${f3(best.proxy.fpr.neg_train)} · src ${f3(best.proxy.fpr.neg_src)}`],
   ['val loss (посл.)', f4(last.val_loss), `train ${f4(last.train_loss)} · разрыв ${f3(last.val_loss-last.train_loss)}`],
 ];
-if (R) { let rb = RE.reduce((a,b)=> b.proxy.aic>a.proxy.aic?b:a, RE[0]); tiles.push(['бейзлайн 256², лучший', f4(rb.proxy.aic), `эп. ${rb.epoch} · Dice ${f3(rb.proxy.dice_pos)} · FPR ${f3(rb.proxy.fpr_main)}`]); }
+if (last.proxy.cls) tiles.push(['классификатор (посл.)', f3(last.proxy.cls.acc), `tpr ${f3(last.proxy.cls.tpr)} · tnr ${f3(last.proxy.cls.tnr)} · ungated AIC ${f4(last.proxy.aic_ungated)}`]);
+REFS.forEach(r=>{ if(!r.epochs.length) return; let rb = r.epochs.reduce((a,b)=> b.proxy.aic>a.proxy.aic?b:a, r.epochs[0]); tiles.push([r.name.replace(/^vad_|^\d{8}_/,'') + ' · лучший', f4(rb.proxy.aic), `эп. ${rb.epoch}/${r.epochs.length} · Dice ${f3(rb.proxy.dice_pos)} · FPR ${f3(rb.proxy.fpr_main)}`]); });
 document.getElementById('tiles').innerHTML = tiles.map(t=>`<div class="tile"><div class="k">${t[0]}</div><div class="v mono">${t[1]}</div><div class="d">${t[2]}</div></div>`).join('');
 
 // ---- charts
@@ -140,21 +141,25 @@ function chart(el, title, note, series, opts={}) {
   svg.addEventListener('mouseleave', ()=>{tip.style.display='none';cross.style.display='none';});
 }
 const S1=css('--s1'), S2=css('--s2'), S3=css('--s3'), S4=css('--s4'), S5=css('--s5'), S6=css('--s6'), S7=css('--s7');
+const RC=[S2,S4,S5,S6];
+const refSeries = fn => REFS.map((r,i)=>({name:r.name.replace(/^vad_|^\d{8}_/,''), color:RC[i%RC.length], pts:pts(r.epochs, fn)}));
 const pts = (arr, fn) => arr.map(r=>[r.epoch, fn(r)]);
 const holder = document.getElementById('charts');
 const add = (title, note, series, opts) => { const d=document.createElement('div'); d.className='card'; holder.appendChild(d); chart(d,title,note,series,opts); };
-const refName = R ? 'бейзлайн 256² BCE' : null;
-add('Proxy AIC', 'Dice per image + FPR_main на proxy-подмножестве, t = 0.5, без a_min; пунктир — официальная метрика на PNG', [
+add('Proxy AIC', 'Dice per image + FPR_main на proxy-подмножестве, t = 0.5' + (E.some(r=>r.proxy.cls)?', с гейтингом τ = 0.5':'') + '; пунктир — официальная метрика на PNG; другие цвета — референс-раны', [
   {name:'proxy AIC', color:S1, pts:pts(E,r=>r.proxy.aic), best:best.epoch},
   {name:'full AIC', color:S1, dash:true, pts:pts(E,r=>r.full?r.full.aic:null)},
-  ...(R?[{name:refName, color:S2, pts:pts(RE,r=>r.proxy.aic)}]:[])], {markBest:true, dec:3});
+  ...refSeries(r=>r.proxy.aic)], {markBest:true, dec:3});
+if (E.some(r=>r.proxy.cls)) add('Image-level голова', 'accuracy при p ≥ 0.5; TPR/TNR при τ = 0.5; ungated AIC — без гейтинга', [
+  {name:'acc', color:S1, pts:pts(E,r=>r.proxy.cls?r.proxy.cls.acc:null)}, {name:'tpr', color:S3, pts:pts(E,r=>r.proxy.cls?r.proxy.cls.tpr:null)},
+  {name:'tnr', color:S4, pts:pts(E,r=>r.proxy.cls?r.proxy.cls.tnr:null)}, {name:'ungated AIC', color:S7, dash:true, pts:pts(E,r=>r.proxy.aic_ungated)}], {ymin:0, ymax:1, dec:2});
 add('Loss', 'train vs val (' + (c.loss||'') + '); рост val при падающем train — переобучение', [
   {name:'train', color:S3, pts:pts(E,r=>r.train_loss)}, {name:'val-tune', color:S1, pts:pts(E,r=>r.val_loss)}], {dec:3});
 add('Dice_pos', 'среднее по позитивам proxy', [
-  {name:'Dice', color:S1, pts:pts(E,r=>r.proxy.dice_pos)}, ...(R?[{name:refName, color:S2, pts:pts(RE,r=>r.proxy.dice_pos)}]:[])], {dec:3});
+  {name:'Dice', color:S1, pts:pts(E,r=>r.proxy.dice_pos)}, ...refSeries(r=>r.proxy.dice_pos)], {dec:3});
 add('FPR по пулам', 'доля чистых кадров с маской ≥ 1 % при t = 0.5; FPR_main = среднее двух пулов', [
   {name:'neg_train', color:S1, pts:pts(E,r=>r.proxy.fpr.neg_train)}, {name:'neg_src', color:S3, pts:pts(E,r=>r.proxy.fpr.neg_src)},
-  ...(R?[{name:refName+' (main)', color:S2, pts:pts(RE,r=>r.proxy.fpr_main)}]:[])], {ymin:0, ymax:1, dec:2});
+  ...refSeries(r=>r.proxy.fpr_main).map(s=>({...s, name:s.name+' (main)'}))], {ymin:0, ymax:1, dec:2});
 if (E.some(r=>r.proxy.dice_by_area)) add('Dice по площади GT', 'доля кадра, занятая манипуляцией', [
   {name:'< 1 %', color:S1, pts:pts(E,r=>get(r,'proxy.dice_by_area.lt1'))}, {name:'1–5 %', color:S3, pts:pts(E,r=>get(r,'proxy.dice_by_area.1-5'))},
   {name:'5–20 %', color:S4, pts:pts(E,r=>get(r,'proxy.dice_by_area.5-20'))}, {name:'> 20 %', color:S7, pts:pts(E,r=>get(r,'proxy.dice_by_area.gt20'))}], {ymin:0, ymax:1, dec:2});
@@ -177,11 +182,12 @@ document.getElementById('foot').textContent = `Обновлено ${DATA.generat
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--main', required=True)
-    ap.add_argument('--ref', default=None)
+    ap.add_argument('--ref', action='append', default=[], help='референс-ран(ы) для сравнения; можно несколько')
     ap.add_argument('--out', required=True)
     ap.add_argument('--title', default=None)
     args = ap.parse_args()
-    data = dict(main=load(Path(args.main)), ref=load(Path(args.ref)) if args.ref else None,
+    refs = [load(Path(r)) for r in args.ref if (Path(r) / 'log.jsonl').exists()]
+    data = dict(main=load(Path(args.main)), refs=refs, ref=refs[0] if refs else None,
                 generated=datetime.now().strftime('%Y-%m-%d %H:%M'))
     title = args.title or f"Обучение {data['main']['name']}"
     html = TEMPLATE.replace('__TITLE__', title).replace('__DATA__', json.dumps(data, ensure_ascii=False).replace('</', '<\\/'))
