@@ -477,7 +477,7 @@ def main():
         if main_proc:
             va_loss, pm, panel = validate(model, dl_val, criterion, device, df_val, args.amp, img_idx)
             fm = None
-            if args.full_every and (epoch % args.full_every == 0 or epoch == args.epochs):
+            if args.full_every and not args.val_limit and (epoch % args.full_every == 0 or epoch == args.epochs):
                 fm = full_metric(model, df_proxy, args, device, run_dir, epoch)
             lr_now = optimizer.param_groups[0]['lr']
             rec = dict(epoch=epoch, train_loss=tr_loss, val_loss=va_loss, proxy=pm, full=fm, lr=lr_now,
