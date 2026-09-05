@@ -1,0 +1,500 @@
+{
+ "train_rows": 103699,
+ "rows_with_src": 48239,
+ "unique_src": 42530,
+ "src_files_on_disk": 42530,
+ "src_files_not_in_csv": 0,
+ "ext_src_orphans": [],
+ "split_cols": [
+  "chng_img_path",
+  "gt_path",
+  "orgl_img_path",
+  "domain",
+  "generator",
+  "group_id",
+  "fold",
+  "role",
+  "is_neg",
+  "neg_pool",
+  "in_proxy",
+  "H",
+  "W",
+  "gt_area"
+ ],
+ "split_roles": {
+  "train": 86605,
+  "val-tune": 13285,
+  "val-report": 6647
+ },
+ "neg_pool_by_role": {
+  "('train', 'neg_train')": 1247,
+  "('val-report', 'neg_src')": 1000,
+  "('val-report', 'neg_train')": 624,
+  "('val-tune', 'neg_src')": 2000,
+  "('val-tune', 'neg_train')": 1247
+ },
+ "src_scenes_train_role": 36064,
+ "split_role_domain": {
+  "('train', 'Dxx')": 11216,
+  "('train', 'coco')": 28458,
+  "('train', 'ids8')": 8440,
+  "('train', 'ids9')": 20362,
+  "('train', 'inp')": 5668,
+  "('train', 'openimages')": 2428,
+  "('train', 'raise')": 10033,
+  "('val-report', 'Dxx')": 677,
+  "('val-report', 'coco')": 2447,
+  "('val-report', 'ids8')": 1047,
+  "('val-report', 'ids9')": 1197,
+  "('val-report', 'inp')": 328,
+  "('val-report', 'openimages')": 214,
+  "('val-report', 'raise')": 737,
+  "('val-tune', 'Dxx')": 1308,
+  "('val-tune', 'coco')": 4914,
+  "('val-tune', 'ids8')": 2094,
+  "('val-tune', 'ids9')": 2396,
+  "('val-tune', 'inp')": 658,
+  "('val-tune', 'openimages')": 432,
+  "('val-tune', 'raise')": 1483
+ },
+ "rows_per_scene_src_domains": {
+  "count": 42433.0,
+  "mean": 1.2053354700351142,
+  "std": 0.5107699446050455,
+  "min": 1.0,
+  "25%": 1.0,
+  "50%": 1.0,
+  "75%": 1.0,
+  "max": 7.0
+ },
+ "size_by_domain": {
+  "ids9": {
+   "n": 23955,
+   "w_med": 1024.0,
+   "h_med": 683.0,
+   "w_min": 419,
+   "w_max": 1024,
+   "h_min": 331,
+   "h_max": 1024,
+   "side1024": 0.8266666666666667,
+   "fmt": {
+    "JPEG": 300
+   },
+   "jpeg_qt_mean": 14.738177083333333,
+   "jpeg_qt_p10_p90": [
+    8.09375,
+    21.84375
+   ]
+  },
+  "ids8": {
+   "n": 11581,
+   "w_med": 640.0,
+   "h_med": 480.0,
+   "w_min": 289,
+   "w_max": 640,
+   "h_min": 201,
+   "h_max": 640,
+   "side1024": 0.0,
+   "fmt": {
+    "JPEG": 300
+   },
+   "jpeg_qt_mean": 1.0,
+   "jpeg_qt_p10_p90": [
+    1.0,
+    1.0
+   ]
+  },
+  "coco": {
+   "n": 35819,
+   "w_med": 640.0,
+   "h_med": 480.0,
+   "w_min": 56,
+   "w_max": 1024,
+   "h_min": 72,
+   "h_max": 1024,
+   "side1024": 0.19333333333333333,
+   "fmt": {
+    "JPEG": 300
+   },
+   "jpeg_qt_mean": 2.2655729166666667,
+   "jpeg_qt_p10_p90": [
+    1.0,
+    5.765625
+   ]
+  },
+  "openimages": {
+   "n": 3074,
+   "w_med": 1024.0,
+   "h_med": 731.0,
+   "w_min": 240,
+   "w_max": 1024,
+   "h_min": 224,
+   "h_max": 1024,
+   "side1024": 0.83,
+   "fmt": {
+    "JPEG": 300
+   },
+   "jpeg_qt_mean": 4.57421875,
+   "jpeg_qt_p10_p90": [
+    1.0,
+    5.765625
+   ]
+  },
+  "raise": {
+   "n": 12253,
+   "w_med": 1024.0,
+   "h_med": 678.0,
+   "w_min": 672,
+   "w_max": 1024,
+   "h_min": 672,
+   "h_max": 1024,
+   "side1024": 1.0,
+   "fmt": {
+    "JPEG": 300
+   },
+   "jpeg_qt_mean": 5.320833333333334,
+   "jpeg_qt_p10_p90": [
+    5.765625,
+    5.765625
+   ]
+  },
+  "inp": {
+   "n": 6654,
+   "w_med": 500.0,
+   "h_med": 375.0,
+   "w_min": 253,
+   "w_max": 500,
+   "h_min": 253,
+   "h_max": 500,
+   "side1024": 0.0,
+   "fmt": {
+    "JPEG": 300
+   },
+   "jpeg_qt_mean": 1.0,
+   "jpeg_qt_p10_p90": [
+    1.0,
+    1.0
+   ]
+  },
+  "Dxx": {
+   "n": 13201,
+   "w_med": 1024.0,
+   "h_med": 768.0,
+   "w_min": 960,
+   "w_max": 1024,
+   "h_min": 469,
+   "h_max": 768,
+   "side1024": 0.97,
+   "fmt": {
+    "JPEG": 300
+   },
+   "jpeg_qt_mean": 1.0,
+   "jpeg_qt_p10_p90": [
+    1.0,
+    1.0
+   ]
+  }
+ },
+ "stage1_src_same_shape_frac": 0.705,
+ "stage1_diff_vs_gt": {
+  "gt": 0.15217572380514705,
+  "diff": 0.1187315634218289,
+  "diff_in_gt": 0.8074431218924213,
+  "diff_out_gt": 0.0
+ },
+ "nb_rows": 19948,
+ "nb_cols": [
+  "orgl_img_path",
+  "chng_img_path",
+  "prompt"
+ ],
+ "nb_unique_src": 19948,
+ "nb_unique_chng": 19948,
+ "nb_prompt_top_words": [
+  [
+   "with",
+   19335
+  ],
+  [
+   "ensuring",
+   14669
+  ],
+  [
+   "lighting",
+   14544
+  ],
+  [
+   "seamlessly",
+   9073
+  ],
+  [
+   "existing",
+   8066
+  ],
+  [
+   "texture",
+   8011
+  ],
+  [
+   "while",
+   7389
+  ],
+  [
+   "image",
+   6641
+  ],
+  [
+   "white",
+   6273
+  ],
+  [
+   "natural",
+   6255
+  ],
+  [
+   "maintaining",
+   6238
+  ],
+  [
+   "color",
+   6045
+  ],
+  [
+   "original",
+   6044
+  ],
+  [
+   "slightly",
+   5305
+  ],
+  [
+   "text",
+   5038
+  ],
+  [
+   "left",
+   4948
+  ],
+  [
+   "into",
+   4886
+  ],
+  [
+   "background",
+   4770
+  ],
+  [
+   "dark",
+   4717
+  ],
+  [
+   "right",
+   4604
+  ],
+  [
+   "consistent",
+   4499
+  ],
+  [
+   "scene",
+   4497
+  ],
+  [
+   "blue",
+   4456
+  ],
+  [
+   "shadows",
+   4387
+  ],
+  [
+   "black",
+   4092
+  ],
+  [
+   "light",
+   4005
+  ],
+  [
+   "more",
+   3938
+  ],
+  [
+   "their",
+   3794
+  ],
+  [
+   "from",
+   3787
+  ],
+  [
+   "green",
+   3737
+  ],
+  [
+   "realistic",
+   3725
+  ],
+  [
+   "soft",
+   3678
+  ],
+  [
+   "subtle",
+   3341
+  ],
+  [
+   "vibrant",
+   3307
+  ],
+  [
+   "style",
+   3207
+  ],
+  [
+   "extending",
+   2956
+  ],
+  [
+   "naturally",
+   2821
+  ],
+  [
+   "overall",
+   2747
+  ],
+  [
+   "current",
+   2645
+  ],
+  [
+   "subtly",
+   2625
+  ]
+ ],
+ "nb_prompt_examples": [
+  "Relocate the green stick from its current position on the left side of the bedding to a new spot closer to the hamster, placing it diagonally across the bedding to the hamster's right, ensuring the stick's vibrant green color and wood texture are preserved, and that it casts a realistic shadow consistent with the soft, ambient lighting of the cage environment.",
+  "Replace the person hiking on the dirt path with a realistic, naturally colored deer walking uphill, ensuring its size and perspective seamlessly integrate into the bright, sunny mountain landscape with matching shadows and natural fur texture.",
+  "Change the brown body plumage of both flying geese to a rich, dark auburn, ensuring the new color integrates seamlessly with the existing feather texture and realistic lighting, while maintaining the natural appearance of the birds over the water.",
+  "Replace the green 'Westphal's Auxiliator' hair tonic bottle in the center-left of the image with a vintage amber-colored glass jar of old-fashioned shaving cream, featuring a distressed cream-colored label with dark brown text, ensuring the new object's glass texture, reflections, and shadows are consistent with the surrounding bottles and the warm, slightly dim lighting of the scene, maintaining the original depth of field and vintage aesthetic.",
+  "Change the font of all visible text elements on the page, including the title, subtitle, recipe instructions, and the 'Eating-In' logo text, to a modern, clean sans-serif font like 'Open Sans' or 'Lato', and update their color to a deep, warm brown (#6B4423) to complement the food imagery, ensuring legibility against the white background.",
+  "Replace the fantastical viking helmet worn by the man with glasses in the middle-right with a realistic, dark gray knit beanie, ensuring the beanie's texture, folds, and cast shadows accurately reflect the bright, natural lighting of the bus interior and conform naturally to his head shape for seamless integration into the scene.",
+  "Subtly adjust the model's left arm by slightly lowering the elbow by approximately 5 to 10 degrees and gently rotating the wrist inward, ensuring the hand remains naturally placed on the hip with a relaxed posture, while maintaining seamless integration with the existing lighting, shadows, and overall aesthetic of the original image.",
+  "Add a clear glass of water, half-filled and with a subtle condensation, positioned naturally on the wooden podium to the right of the microphone (from the viewer's perspective), ensuring realistic reflections and shadows consistent with the scene's existing soft lighting and the wooden texture of the podium.",
+  "Modify the Budweiser bottle to appear as a vintage 1950s-era bottle, replacing its current label with an authentic period-specific Budweiser design and subtly altering the glass texture to suggest an older bottling, while maintaining the current hot dog's appearance and the overall bar lighting.",
+  "Add a weathered, leather-bound book with slightly torn pages and a dark, faded cover, resting open on the moss-covered stone table towards the left side, positioned to appear as if it has been there for a long time, with subtle natural lighting and shadows that integrate it seamlessly into the scene's aged aesthetic.",
+  "Remove the large architectural model of the building being held by the two women, seamlessly reconstructing the background with the grassy field, paved ground, and distant figures, while maintaining the golden hour lighting and natural shadows.",
+  "Change the feather color of both sandhill cranes from their current light grey to a vibrant, iridescent blue, ensuring the new color is realistically integrated with the existing lighting and shadows, and that the natural texture and sheen of their plumage are preserved.",
+  "Transform the person into a Pixar/Disney-like 3D cartoon character, featuring smooth, stylized textures for their skin and clothing, vibrant yet naturalistic colors, and soft, studio-quality lighting that seamlessly integrates with the existing photographic background, while faithfully retaining their current pose and interaction with the motorcycle.",
+  "Seamlessly relocate the baby from its current partially overlapped position to lie directly beside the older child on the white bedding, ensuring both children are clearly visible side-by-side, maintaining their original joyful expressions, and adjusting lighting and shadows for a natural, cohesive composition that blends with the existing soft, warm ambient light and preserves the texture of their clothing and skin.",
+  "Reduce the size of the foreground tennis ball by 15% and subtly rotate it to clearly display the 'Slazenger' logo in a horizontal orientation, ensuring its worn, dusty texture and the image's soft, diffused lighting are naturally preserved."
+ ],
+ "nb_same_shape_frac": 1.0,
+ "nb_shape_examples": [
+  [
+   1024,
+   768,
+   1024,
+   768
+  ],
+  [
+   1024,
+   768,
+   1024,
+   768
+  ],
+  [
+   1017,
+   589,
+   1017,
+   589
+  ],
+  [
+   1024,
+   768,
+   1024,
+   768
+  ],
+  [
+   791,
+   999,
+   791,
+   999
+  ],
+  [
+   1024,
+   679,
+   1024,
+   679
+  ],
+  [
+   761,
+   846,
+   761,
+   846
+  ],
+  [
+   680,
+   1023,
+   680,
+   1023
+  ],
+  [
+   684,
+   1023,
+   684,
+   1023
+  ],
+  [
+   1024,
+   768,
+   1024,
+   768
+  ]
+ ],
+ "nb_diff_area_quantiles": {
+  "d25": [
+   0.016147722278968123,
+   0.031799108999994594,
+   0.08445163109050725,
+   0.15771529735195006,
+   0.3020830230862109
+  ],
+  "d40": [
+   0.0068054957276305495,
+   0.01171474714331011,
+   0.044031826286456056,
+   0.11189838318989992,
+   0.2058676899972718
+  ],
+  "d60": [
+   0.0022838373284338673,
+   0.005659252388063795,
+   0.02083922788355154,
+   0.06696619990040163,
+   0.14397097258694885
+  ],
+  "mean_abs": [
+   5.45237664563406,
+   7.193801740382493,
+   11.12342583947029,
+   18.140340672459324,
+   29.582329261997014
+  ]
+ },
+ "nb_global_change_frac": 0.02,
+ "nb_chng_formats": {
+  "JPEG": 60
+ },
+ "nb_src_formats": {
+  "JPEG": 60
+ },
+ "mask_ncomp_hist": {
+  "5": 57,
+  "1": 274,
+  "3": 16,
+  "2": 36,
+  "4": 9
+ },
+ "mask_bbox_fill_median": 0.644119096690152
+}
