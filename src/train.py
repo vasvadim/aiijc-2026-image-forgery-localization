@@ -312,7 +312,7 @@ def main():
     ap.add_argument('--loss', default='bce', choices=['bce', 'bce_dice'])
     ap.add_argument('--aux-head', action='store_true', help='image-level голова «есть ли правка» (smp aux_params), гейтинг при инференсе')
     ap.add_argument('--cls-weight', type=float, default=0.5, help='вес BCE image-level головы в общем loss')
-    ap.add_argument('--aug', default='none', choices=['none', 'v1'], help='аугментации робастности (data.AUG_PRESETS): v1 = rescale/JPEG/blur/noise')
+    ap.add_argument('--aug', default='none', choices=['none', 'v1', 'v2'], help='аугментации робастности (data.AUG_PRESETS): v1 = rescale/JPEG q60–100/blur/noise (агрессивный), v2 = мягче, под распределение теста (JPEG q75–100, p 0.3)')
     ap.add_argument('--neg-src', type=int, default=0, help='сколько src-оригиналов train-сцен добавить в обучение как негативы (0 — не добавлять)')
     ap.add_argument('--scheduler', default='none', choices=['none', 'cosine'])
     ap.add_argument('--seed', type=int, default=42)

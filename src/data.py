@@ -23,6 +23,9 @@ cv2.setNumThreads(0)
 AUG_PRESETS = {
     'none': None,
     'v1': dict(p_rescale=0.3, scale=(0.5, 1.0), p_jpeg=0.5, q=(60, 100), p_blur=0.15, sigma=(0.3, 1.0), p_noise=0.15, noise=(1.0, 5.0)),
+    # v2 — под распределение теста (RESEARCH.md §3.2: 64 % q100, 13 % q95, 23 % q80–94; q<80 нет):
+    # ~55 % картинок остаются нетронутыми, диапазон q75–100
+    'v2': dict(p_rescale=0.2, scale=(0.5, 1.0), p_jpeg=0.3, q=(75, 100), p_blur=0.1, sigma=(0.3, 1.0), p_noise=0.1, noise=(1.0, 5.0)),
 }
 _INTERP = (cv2.INTER_LINEAR, cv2.INTER_AREA, cv2.INTER_CUBIC)
 
