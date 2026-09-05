@@ -22,6 +22,10 @@ CUDA_VISIBLE_DEVICES=6 python src/train.py --run-name 20260902_baseline_r34_256 
     --select-by proxy --full-every 1 --workers 8 --amp
 ```
 
+**Аугментации** — `--aug v1` (по умолчанию `none`, только hflip): на исходном разрешении rescale
+вниз-вверх (p 0.3), JPEG q60–100 (p 0.5), blur (p 0.15), noise (p 0.15); пресеты в `data.AUG_PRESETS`.
+Мотивация и замеры — RESEARCH.md §3.5 (пункт 1 плана). Аугментации применяются и к негативам.
+
 **Несколько GPU (DDP)** — тот же скрипт через `torchrun`; `--batch-size` задаётся на каждую карту,
 lr автоматически не масштабируется (эффективный батч = batch × число карт):
 

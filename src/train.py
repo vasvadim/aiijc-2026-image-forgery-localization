@@ -312,6 +312,7 @@ def main():
     ap.add_argument('--loss', default='bce', choices=['bce', 'bce_dice'])
     ap.add_argument('--aux-head', action='store_true', help='image-level голова «есть ли правка» (smp aux_params), гейтинг при инференсе')
     ap.add_argument('--cls-weight', type=float, default=0.5, help='вес BCE image-level головы в общем loss')
+    ap.add_argument('--aug', default='none', choices=['none', 'v1'], help='аугментации робастности (data.AUG_PRESETS): v1 = rescale/JPEG/blur/noise')
     ap.add_argument('--neg-src', type=int, default=0, help='сколько src-оригиналов train-сцен добавить в обучение как негативы (0 — не добавлять)')
     ap.add_argument('--scheduler', default='none', choices=['none', 'cosine'])
     ap.add_argument('--seed', type=int, default=42)
@@ -384,7 +385,7 @@ def main():
     if main_proc:
         print(f'train={len(df_train)} val-tune={len(df_val)} proxy={len(df_proxy)} world={world} run_dir={run_dir}', flush=True)
 
-    ds_train = SegDataset(df_train, args.img_size, train=True)
+    ds_train = SegDataset(df_train, args.img_size, train=True, aug=args.aug)
     sampler = DistributedSampler(ds_train, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler,
                           num_workers=args.workers, pin_memory=True, drop_last=True, persistent_workers=args.workers > 0)
