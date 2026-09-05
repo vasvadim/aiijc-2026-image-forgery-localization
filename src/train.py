@@ -294,7 +294,9 @@ def rng_state() -> dict:
 def set_rng_state(s: dict) -> None:
     random.setstate(s['python']); np.random.set_state(s['numpy']); torch.set_rng_state(s['torch'])
     if s.get('cuda') is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(s['cuda'])
+        # число видимых GPU при resume может отличаться от сохранённого (4 → 2): восстанавливаем по доступным
+        for i, st in enumerate(s['cuda'][:torch.cuda.device_count()]):
+            torch.cuda.set_rng_state(st, i)
 
 
 # ----------------------------------------------------------------------------- main
