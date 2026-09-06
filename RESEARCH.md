@@ -347,3 +347,65 @@ GFLOPs итого) или ~640 (≈ 75). Это обмен «сильные пр
 - DINOv3 на HF: https://huggingface.co/facebook/dinov3-convnext-tiny-pretrain-lvd1689m , timm: https://huggingface.co/timm/convnext_tiny.dinov3_lvd1689m
 - Kaggle Recod.ai/LUC (2026): https://www.kaggle.com/competitions/recodai-luc-scientific-image-forgery-detection , обзор решений: https://zenn.dev/yuki16/articles/27a60b48fa1e11
 - HF-поиск: https://huggingface.co/api/models?search=forgery , `benjaik/trufor-ph2`
+
+
+## 8. Главная проблема и что про неё известно (ресёрч 06.09, по контролю b4 ep20)
+
+### 8.1 Формулировка проблемы цифрами (val-report ep20, Dice позитивов 0.900, дефицит 0.100)
+
+| Разрез | n | Dice | Доля дефицита |
+|---|---|---|---|
+| **ids9** | 1197 | **0.775** | **54 %** |
+| coco / Dxx / raise / inp / openimages / ids8 | 1670 / 677 / 587 / 328 / 141 / 423 | 0.96 / 0.92 / 0.92 / 0.92 / 0.81 / 0.98 | 13 / 11 / 9 / 5 / 5 / 2 % |
+| маски 1–5 % кадра | 831 | 0.768 | **38 %** |
+| маски 5–20 % | 2023 | 0.914 | 35 % |
+| маски <1 % | 104 | 0.472 | 11 % |
+| генератор «unknown» (= ids9) | 1620 | 0.827 | 56 % |
+
+Внутри ids9 (разбор b4 ep6): маски 1–5 % — Dice 0.58, **37 % картинок с Dice < 0.5** (промах или пусто), 5–20 % — 0.76.
+Recall = precision (§3.7), границы «дрожат» симметрично, порог плоский. Итого **главная проблема — не границы и не
+«неполные маски», а промахи: маленькие (1–5 % кадра) свободной формы перегенерированные области в JPEG q80–95
+от неизвестного генератора, без семантической подсказки (маска не объект), с сохранённым оригинальным фоном.**
+Разрешение не виновато: ids9 нативно 1024×683, мы подаём 1024².
+
+### 8.2 Что говорит литература / Kaggle / хакатоны (2025–26)
+
+| Источник | Что сделали | Число | Применимо к нам? |
+|---|---|---|---|
+| **INP-X** (arXiv 2602.00192) — «детекторы полагаются на глобальные артефакты» | вернули оригинальные пиксели вне маски: все детекторы (Corvi, Sightengine, Hive) падают с 92–94 % до 55 % | — | Это ровно наш ids9: фон оригинальный → только локальная улика. Объясняет, почему домен худший. |
+| **FUSED** (2608.28302), MoE forensic(SparseViT)+semantic(CLIP-ConvNeXt-XXL) | лучший на OpenSDID cross-generator (pixel F1 55) | **IoU < 0.25 при правке < 2 % кадра даже у SOTA**; ошибка — не «пустая маска», а неверная локализация | Не влезает (CLIP-XXL). Вывод: мелкие правки — общая нерешённая проблема, ждать чуда не стоит. |
+| **COCO-Inpaint** (2504.18361), 238k правок, 6 генераторов, 4 типа масок | CNN (PSCC) на масках < 20 % кадра выдаёт ~пустые маски, ViT/SegFormer держатся; in-domain F1 86.6 → cross-generator 23.2; обучение на 5 генераторах резко помогает | обучающие маски **0.4–0.6 кадра генерализуются лучше**; случайные боксы генерализуются лучше всего, **неровные полигоны — хуже всего** | Прямо про mask-mixing: добавить крупные площади и боксы/эллипсы, а не только ids9-распределение (медиана 0.1). |
+| **DinoLizer** (2511.20722), DINOv2-B + LoRA, patch-голова 14×14, sliding window 504/128 | **3 класса пикселей: real / VAE-перегенерировано / inpainted** вместо 2 | 3 класса vs 2: IoU 0.51 → 0.55 (+6 %); +20 % IoU над TruFor; устойчив к (двойному) JPEG за счёт JPEG-аугментации QF 40–100 p=0.5 | Идея «перегенерировано ≠ правка» — это наша нанобанана: правки Gemini перерисованы целиком. Третий класс для пикселей nb вне diff-маски — способ использовать nb без порчи целевой маски. ≈ 0 FLOPs. |
+| **Loupe** (2506.16819, 1-е место IJCAI-2025 DDL) | patch-aware классификатор + сегментация с conditional queries; TTA по псевдометкам патчей | score 0.846, seg F1 0.886 | Patch-голова на глубоких признаках — ≈ 0 FLOPs. TTA на тесте нам нельзя. |
+| **MediaEval 2025 SynthIM**, победные working notes (VNU-HCM, paper25) + **EDGER** (2605.12002) | SegFormer-B3 + FreqEdge (SRM/HPF/Sobel/Laplacian → edge-маска, 4-й канал) + **heatmap патч-классификатора CLIP-ViT (Hann-окна), слияние max** | IoU SP-val: RGB 0.298 → +Edge 0.440 → **+Heatmap 0.602**; EDGER 0.590 vs SOTA 0.36 | Heatmap патч-классификатора даёт больше всего. Sliding window CLIP нам не по FLOPs, но патч-голова на своём энкодере — да. Edge-канал у них +0.14, у нас edge-loss дал 0 (наш b4@1024 сам видит границы). |
+| **PIDA / Pixel-Inconsistency** (2310.00234) | self-blended позитивы только из реальных картинок (донор→фон, с искажениями) + boundary-декодер + difference-conv | PIDA +0.027 F1 (0.233→0.260) | Это наш mask-mixing; ожидать малый плюс. |
+| **ReVi / Off-the-shelf models** (2604.09096) | адаптер к замороженным SegFormer-b1/TinySAM/LDM, 256², edge-loss λ=20 | SegFormer-b1+ReVi F1 71.8 fine-tuned (IML-ViT 71.0) | Семантический prior важен; наш imagenet-b4 — норм. Edge-loss у них обязателен, у нас проверен — 0. |
+| **SparseViT** (AAAI-25) | блочное sparse-attention → несемантические признаки | 46 GFLOPs @512, F1 avg 0.671 vs TruFor 0.627, устойчив к JPEG | Кандидат на энкодер @704 (≈ 90 GFLOPs), но 10 дней и опыт с DINO (FLOPs) — не успеем проверить честно. |
+| **Guided-noise + ARPM** (2412.01622) | RGB+шум, dilated-пирамида | маски < 1 %: F1 55.8, AUC 87.1 (256²) | Наш HP/SRM-вход (§3.6): 0…+0.3 п.п. |
+| **IFA-Net** (CVPR-26), **GAP-SAM** (2608.20929), **DiffusionPrint** (2604.12443) | MAE-residual / VAE-reconstruction prior + SAM3 / контрастивный fingerprint генератора | IoU 0.78 GIT-avg; +12.6 F1 cross-gen; +28 % на невиданных типах масок | Все требуют MAE/VAE/SAM3 в инференсе — мимо лимита. Из DiffusionPrint дёшево берётся только aux-голова «какой генератор» (у stage1 есть метки). |
+| **Kaggle Recod.ai/LUC 2026** (copy-move в биомед.) | SAM3-панели + SIFT/FLANN/RANSAC (3-е), DINOv3-сегментация (5-е) | — | Другая задача (copy-move), переносить нечего. |
+| **HSIM/RITA** (2509.20006) | многошаговые правки, авторегрессия масок | F1 0.643 vs Mesorch 0.593 | Не наш сценарий. |
+
+### 8.3 Что из этого может помочь нам (ранжировано; всё ≈ 0 FLOPs, тёплый старт с контроля ep20)
+
+1. **Patch-голова (Loupe / MediaEval CBL)**: на самом глубоком признаке энкодера b4 (32×32 при 1024²) — BCE «в патче есть
+   правка» (метка: доля GT в патче ≥ 5 %), вес 0.5 как у image-головы; на инференсе маска = max(p_pixel, up(p_patch)·γ)
+   или p_pixel·(α+up(p_patch)), γ/α подбираем на val-tune. Бьёт ровно по промахам «пустая/не там» на мелких масках —
+   у победителей MediaEval это самый большой вклад (+0.16 IoU). Ожидание у нас: ids9 +0.02…0.05 Dice → AIC +0.3…0.8 п.п.
+2. **Три класса пикселей (DinoLizer)**: 0 = real, 1 = правка (stage1 GT, nb diff-маска), 2 = «перегенерировано без
+   правки» (nb-правки вне diff-маски). Софтмакс-голова 3 канала; Dice на канале 1. Учит «перерисовано ≠ правка», nb-данные
+   идут в дело без риска сломать маску (класс 2 не требует точной маски). У DinoLizer +6 % IoU. Ожидание: +0…+0.5 п.п.
+3. **Mask-mixing v2 по COCO-Inpaint**: половина площадей из U(0.3, 0.6), формы — бокс/эллипс/полигон поровну (сейчас
+   только площади ids9 и бокс/эллипс). Делать после результата текущего mask-mix.
+4. **Aux-голова «генератор» (DiffusionPrint lite)**: 8 классов по stage1 (brushnet/hdpainter/…/unknown=ids9), вес 0.2.
+   Заставляет энкодер учить fingerprint. Дёшево, эффект неизвестен.
+5. Не делаем: TTA/псевдометки на тесте (запрет), sliding window/тайлинг (FLOPs на изображение), SparseViT/DINO (время,
+   FLOPs), MAE/VAE/SAM-приоры (FLOPs), edge-loss/Tversky/HP-вход (проверено или оценено — 0).
+
+Ссылки §8: INP-X https://arxiv.org/abs/2602.00192 · FUSED https://arxiv.org/abs/2608.28302 · COCO-Inpaint
+https://arxiv.org/abs/2504.18361 · DinoLizer https://arxiv.org/abs/2511.20722 · Loupe https://arxiv.org/abs/2506.16819 ·
+MediaEval-25 paper25 https://2025.multimediaeval.com/paper25.pdf · EDGER https://arxiv.org/abs/2605.12002 · PIDA
+https://arxiv.org/abs/2310.00234 · ReVi https://arxiv.org/abs/2604.09096 · SparseViT https://arxiv.org/abs/2412.14598 ·
+Guided-noise https://arxiv.org/abs/2412.01622 · IFA-Net https://arxiv.org/abs/2602.18842 · GAP-SAM
+https://arxiv.org/abs/2608.20929 · DiffusionPrint https://arxiv.org/abs/2604.12443 · HSIM https://arxiv.org/abs/2509.20006 ·
+Kaggle Recod.ai/LUC https://www.kaggle.com/competitions/recodai-luc-scientific-image-forgery-detection
