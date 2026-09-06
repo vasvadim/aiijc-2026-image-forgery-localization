@@ -55,9 +55,12 @@ def _write(args):
 
 @torch.no_grad()
 def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float, batch_size: int, workers: int,
-                     device, amp: bool, root: Path, path_col: str, save_probs: bool, tau: float = 0.0) -> Path:
+                     device, amp: bool, root: Path, path_col: str, save_probs: bool, tau: float = 0.0,
+                     patch_gamma: float = 0.0, extra_input: str = 'none') -> Path:
     """Пишет <out>/predictions/<stem>_pred.png, <out>/submission.csv (img_path = df[path_col]);
-    если у модели есть image-level голова — ещё <out>/img_probs.csv (stem, p_img) и гейтинг по tau."""
+    если у модели есть image-level голова — ещё <out>/img_probs.csv (stem, p_img) и гейтинг по tau.
+    patch_gamma > 0 — вероятность сливается с patch-головой (forensic.fuse_patch); probs пишутся уже слитые."""
+    from forensic import fuse_patch
     from train import forward
     out = Path(out)
     pred_dir = out / 'predictions'
@@ -65,7 +68,7 @@ def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float
     prob_dir = out / 'probs'
     if save_probs:
         prob_dir.mkdir(exist_ok=True)
-    ds = SegDataset(df, img_size, train=False, root=root, path_col=path_col)
+    ds = SegDataset(df, img_size, train=False, root=root, path_col=path_col, extra_input=extra_input)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=workers, pin_memory=True)
     model.eval()
     rows, img_rows = [], []
@@ -74,8 +77,8 @@ def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float
         for batch in tqdm(dl, desc='predict', leave=False, disable=None):
             x = batch['image'].to(device, non_blocking=True)
             with torch.autocast('cuda', enabled=amp):
-                logits, img_logit = forward(model, x)
-            probs = torch.sigmoid(logits.float())[:, 0].cpu().numpy()
+                logits, img_logit, patch_logit = forward(model, x)
+            probs = fuse_patch(torch.sigmoid(logits.float()), patch_logit, patch_gamma)[:, 0].cpu().numpy()
             img_probs = torch.sigmoid(img_logit.float())[:, 0].cpu().numpy() if img_logit is not None else None
             for i in range(probs.shape[0]):
                 idx = int(batch['idx'][i]); h = int(batch['orig_h'][i]); w = int(batch['orig_w'][i])
@@ -101,9 +104,11 @@ def predict_to_files(model, df, out: Path, img_size: int, t: float, a_min: float
 
 def load_model(ckpt_path: str, device):
     from train import build_model
+    from forensic import adapt_state_dict
     ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    model = build_model(ck['encoder'], weights=None, aux_head=bool(ck.get('aux_head', False)), decoder_channels=ck.get('decoder_channels'))
-    model.load_state_dict(ck['model'])
+    model = build_model(ck['encoder'], weights=None, aux_head=bool(ck.get('aux_head', False)), decoder_channels=ck.get('decoder_channels'),
+                        extra_input=ck.get('extra_input', 'none'), patch_head=bool(ck.get('patch_head', False)))
+    model.load_state_dict(adapt_state_dict(ck['model'], model))
     return model.to(device), ck
 
 
@@ -117,6 +122,7 @@ def main():
     ap.add_argument('--t', type=float, default=0.5)
     ap.add_argument('--a-min', type=float, default=0.0)
     ap.add_argument('--tau', type=float, default=0.0, help='порог image-level головы: p_img < tau → пустая маска (0 — без гейтинга)')
+    ap.add_argument('--patch-gamma', type=float, default=None, help='слияние с patch-головой p = max(p_pix, γ·p_patch); по умолчанию из чекпоинта (0 — не сливать)')
     ap.add_argument('--img-size', default=None, help='WxH или сторона; по умолчанию из чекпоинта')
     ap.add_argument('--batch-size', type=int, default=32)
     ap.add_argument('--workers', type=int, default=8)
@@ -145,11 +151,13 @@ def main():
             split_file = split_path(args.version)
         root, path_col = data_dir(), 'chng_img_path'
 
+    patch_gamma = float(ck.get('patch_gamma', 0.0)) if args.patch_gamma is None else args.patch_gamma
     sub = predict_to_files(model, df, out, img_size, args.t, args.a_min, args.batch_size, args.workers,
-                           device, args.amp, root, path_col, args.save_probs, tau=args.tau)
-    print(f'written {sub} ({len(df)} rows), t={args.t} a_min={args.a_min} tau={args.tau}')
+                           device, args.amp, root, path_col, args.save_probs, tau=args.tau,
+                           patch_gamma=patch_gamma, extra_input=ck.get('extra_input', 'none'))
+    print(f'written {sub} ({len(df)} rows), t={args.t} a_min={args.a_min} tau={args.tau} patch_gamma={patch_gamma} extra_input={ck.get("extra_input", "none")}')
     info = dict(checkpoint=args.checkpoint, epoch=ck.get('epoch'), t=args.t, a_min=args.a_min, tau=args.tau, img_size=img_size,
-                role=args.role or 'test', n=len(df))
+                role=args.role or 'test', n=len(df), patch_gamma=patch_gamma, extra_input=ck.get('extra_input', 'none'))
     if split_file is not None:
         from metric import evaluate, format_report
         res = evaluate(str(sub), str(split_file), None if args.role == 'control' else args.role, str(data_dir()), workers=args.workers)

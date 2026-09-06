@@ -46,6 +46,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import IMAGENET_MEAN, IMAGENET_STD, data_dir, load_split, parse_size, runs_dir, seed_everything, split_path  # noqa: E402
 from data import SegDataset  # noqa: E402
+from forensic import EXTRA_CHANNELS, ForensicUnet, adapt_state_dict, fuse_patch, patch_targets  # noqa: E402
 from metric import MAIN_POOLS, aic  # noqa: E402
 from predict import predict_to_files  # noqa: E402
 
@@ -84,15 +85,18 @@ def all_reduce_mean(x: float, device) -> float:
 
 
 # ----------------------------------------------------------------------------- model / loss
-def build_model(encoder: str, weights: str | None = 'imagenet', aux_head: bool = False, decoder_channels=None) -> nn.Module:
-    """UNet; с aux_head=True возвращает (mask_logits, img_logit) — image-level голова «есть ли правка».
+def build_model(encoder: str, weights: str | None = 'imagenet', aux_head: bool = False, decoder_channels=None,
+                extra_input: str = 'none', patch_head: bool = False) -> nn.Module:
+    """UNet (ForensicUnet): forward → (mask_logits, img_logit | None, patch_logits | None); aux_head — image-level
+    голова «есть ли правка»; extra_input/patch_head — см. forensic.py.
     decoder_channels — ширина UNet-декодера, по умолчанию smp (256,128,64,32,16); узкий (128,64,32,16,8) вдвое дешевле по FLOPs."""
     if encoder.startswith('dino:'):
         from dino_seg import DinoSeg
         return DinoSeg(encoder[5:], pretrained=weights is not None, aux_head=aux_head)
     aux = dict(classes=1, pooling='avg', dropout=0.2) if aux_head else None
     kw = dict(decoder_channels=tuple(decoder_channels)) if decoder_channels else {}
-    return smp.Unet(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None, aux_params=aux, **kw)
+    return ForensicUnet(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None, aux_params=aux,
+                        extra_in=EXTRA_CHANNELS[extra_input], patch_head=patch_head, **kw)
 
 
 def parse_decoder(v):
@@ -103,9 +107,11 @@ def parse_decoder(v):
 
 
 def forward(model, x):
-    """Единый вызов: (mask_logits, img_logit | None)."""
+    """Единый вызов: (mask_logits, img_logit | None, patch_logits | None)."""
     out = model(x)
-    return (out[0], out[1]) if isinstance(out, (tuple, list)) else (out, None)
+    if isinstance(out, (tuple, list)):
+        return (out[0], out[1], out[2] if len(out) > 2 else None)
+    return out, None, None
 
 
 class BceDiceLoss(nn.Module):
@@ -202,38 +208,52 @@ def _denorm(x: torch.Tensor) -> np.ndarray:
     return (np.clip(img, 0, 1) * 255).astype(np.uint8)
 
 
+def _dice_area(prob, g):
+    p = prob > 0.5
+    inter = (p & g).sum(dim=(1, 2, 3)).float()
+    dice = (2 * inter / (p.sum(dim=(1, 2, 3)) + g.sum(dim=(1, 2, 3)) + 1e-6)).cpu().numpy()
+    return dice, p.float().mean(dim=(1, 2, 3)).cpu().numpy()
+
+
 @torch.no_grad()
-def validate(model, loader, criterion, device, df_val: pd.DataFrame, amp: bool, img_idx: set):
-    """Один проход по val-tune: val loss на всех строках + proxy-метрики на in_proxy==1 + панель картинок."""
+def validate(model, loader, criterion, device, df_val: pd.DataFrame, amp: bool, img_idx: set, patch_gamma: float = 0.0):
+    """Один проход по val-tune: val loss на всех строках + proxy-метрики на in_proxy==1 + панель картинок.
+    С patch-головой proxy считается по слитой вероятности (fuse_patch, γ=patch_gamma), а pm['nopatch'] —
+    по чисто пиксельной, чтобы видеть вклад головы."""
     model.eval()
     total, n = 0.0, 0
     prox_idx, prox_dice, prox_area, prox_img, panel = [], [], [], [], {}
+    pix_dice, pix_area = [], []
     for batch in tqdm(loader, desc='val', leave=False, disable=None):
         x = batch['image'].to(device, non_blocking=True)
         y = batch['mask'].to(device, non_blocking=True)
         with torch.autocast('cuda', enabled=amp):
-            logits, img_logit = forward(model, x)
+            logits, img_logit, patch_logit = forward(model, x)
         total += criterion(logits.float(), y).item() * x.shape[0]
         n += x.shape[0]
         idx = batch['idx'].numpy()
         inp = df_val['in_proxy'].values[idx] == 1
         if inp.any():
-            prob = torch.sigmoid(logits.float())
-            p = (prob > 0.5)[inp]
+            prob_pix = torch.sigmoid(logits.float())
+            prob = fuse_patch(prob_pix, patch_logit, patch_gamma)
             g = (y > 0.5)[inp]
-            inter = (p & g).sum(dim=(1, 2, 3)).float()
-            dice = (2 * inter / (p.sum(dim=(1, 2, 3)) + g.sum(dim=(1, 2, 3)) + 1e-6)).cpu().numpy()
-            area = p.float().mean(dim=(1, 2, 3)).cpu().numpy()
+            dice, area = _dice_area(prob[inp], g)
             prox_idx.extend(idx[inp].tolist()); prox_dice.extend(dice.tolist()); prox_area.extend(area.tolist())
+            if patch_logit is not None:
+                d2, a2 = _dice_area(prob_pix[inp], g)
+                pix_dice.extend(d2.tolist()); pix_area.extend(a2.tolist())
             if img_logit is not None:
                 prox_img.extend(torch.sigmoid(img_logit.float())[inp, 0].cpu().numpy().tolist())
             for j in np.where(inp)[0]:
                 if int(idx[j]) in img_idx:
-                    panel[int(idx[j])] = (_denorm(x[j]), (y[j, 0] > 0.5).cpu().numpy(), (prob[j, 0] > 0.5).cpu().numpy())
+                    panel[int(idx[j])] = (_denorm(x[j, :3]), (y[j, 0] > 0.5).cpu().numpy(), (prob[j, 0] > 0.5).cpu().numpy())
     order = np.argsort(prox_idx)
     df_proxy = df_val.iloc[np.array(prox_idx)[order]]
-    pm = proxy_metrics(np.array(prox_dice)[order], np.array(prox_area)[order], df_proxy,
-                       img_prob=np.array(prox_img)[order] if prox_img else None)
+    img_prob = np.array(prox_img)[order] if prox_img else None
+    pm = proxy_metrics(np.array(prox_dice)[order], np.array(prox_area)[order], df_proxy, img_prob=img_prob)
+    if pix_dice:
+        pp = proxy_metrics(np.array(pix_dice)[order], np.array(pix_area)[order], df_proxy, img_prob=img_prob)
+        pm['nopatch'] = dict(aic=pp['aic'], dice_pos=pp['dice_pos'], fpr_main=pp['fpr_main'], dice_by_domain=pp['dice_by_domain'], dice_by_area=pp['dice_by_area'])
     return total / max(n, 1), pm, panel
 
 
@@ -243,7 +263,8 @@ def full_metric(model, df_proxy, args, device, run_dir: Path, epoch: int) -> dic
     out = run_dir / f'full_ep{epoch:02d}'
     predict_to_files(model, df_proxy, out, img_size=args.img_size, t=0.5, a_min=0.0, tau=0.5 if args.aux_head else 0.0,
                      batch_size=args.batch_size, workers=args.workers, device=device, amp=args.amp,
-                     root=data_dir(), path_col='chng_img_path', save_probs=False)
+                     root=data_dir(), path_col='chng_img_path', save_probs=False,
+                     patch_gamma=args.patch_gamma if args.patch_head else 0.0, extra_input=args.extra_input)
     res = evaluate(str(out / 'submission.csv'), str(args.split_file), 'proxy', str(data_dir()), workers=args.workers)
     shutil.rmtree(out, ignore_errors=True)
     m = res['main']
@@ -331,6 +352,11 @@ def main():
     ap.add_argument('--mask-mix', type=float, default=0.0, help='mask-mixing по парам src/chng: вероятность на строку с оригиналом (0 — выключено); маски произвольной формы, площади — эмпирика ids9')
     ap.add_argument('--edge-weight', type=float, default=0.0, help='вес BCE на полосе вокруг контура GT (0 — выключено)')
     ap.add_argument('--init-weights', default=None, help='тёплый старт: загрузить только веса модели из чекпоинта (best_proxy.pth), оптимизатор/scheduler новые')
+    ap.add_argument('--new-lr-mult', type=float, default=1.0, help='при --init-weights: параметры, которых нет в чекпоинте (новые модули), идут отдельной группой с lr × mult')
+    ap.add_argument('--patch-head', action='store_true', help='patch-голова на глубоком признаке энкодера (forensic.py); proxy считается по слитой вероятности')
+    ap.add_argument('--patch-weight', type=float, default=0.5, help='вес BCE patch-головы в общем loss')
+    ap.add_argument('--patch-gamma', type=float, default=0.8, help='слияние p = max(p_pix, γ·up(p_patch)) на валидации/инференсе')
+    ap.add_argument('--extra-input', default='none', choices=list(EXTRA_CHANNELS), help='доп. входные каналы (forensic.py): hp3 = SRM + медианный остаток + локальный std')
     ap.add_argument('--aux-head', action='store_true', help='image-level голова «есть ли правка» (smp aux_params), гейтинг при инференсе')
     ap.add_argument('--cls-weight', type=float, default=0.5, help='вес BCE image-level головы в общем loss')
     ap.add_argument('--aug', default='none', choices=['none', 'v1', 'v2'], help='аугментации робастности (data.AUG_PRESETS): v1 = rescale/JPEG q60–100/blur/noise (агрессивный), v2 = мягче, под распределение теста (JPEG q75–100, p 0.3)')
@@ -406,29 +432,41 @@ def main():
     if main_proc:
         print(f'train={len(df_train)} val-tune={len(df_val)} proxy={len(df_proxy)} world={world} run_dir={run_dir}', flush=True)
 
-    ds_train = SegDataset(df_train, args.img_size, train=True, aug=args.aug, mask_mix=args.mask_mix)
+    ds_train = SegDataset(df_train, args.img_size, train=True, aug=args.aug, mask_mix=args.mask_mix, extra_input=args.extra_input)
     sampler = DistributedSampler(ds_train, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler,
                           num_workers=args.workers, pin_memory=True, drop_last=True, persistent_workers=args.workers > 0)
     dl_val = None
     if main_proc:
-        dl_val = DataLoader(SegDataset(df_val, args.img_size, train=False), batch_size=args.batch_size, shuffle=False,
+        dl_val = DataLoader(SegDataset(df_val, args.img_size, train=False, extra_input=args.extra_input), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
 
-    model = build_model(args.encoder, weights=None if (ckpt or args.init_weights) else 'imagenet', aux_head=args.aux_head, decoder_channels=args.decoder_channels).to(device)
+    model = build_model(args.encoder, weights=None if (ckpt or args.init_weights) else 'imagenet', aux_head=args.aux_head, decoder_channels=args.decoder_channels,
+                        extra_input=args.extra_input, patch_head=args.patch_head).to(device)
+    new_param_names: set[str] = set()
     if args.init_weights and not ckpt:
         init = torch.load(args.init_weights, map_location='cpu', weights_only=False)
-        model.load_state_dict(init['model'])
+        res = model.load_state_dict(adapt_state_dict(init['model'], model), strict=False)
+        if res.unexpected_keys:
+            raise RuntimeError(f'init-weights: лишние ключи {res.unexpected_keys[:5]}')
+        new_param_names = set(res.missing_keys)
         if main_proc:
-            print(f'init-weights: {args.init_weights} (epoch {init.get("epoch")}), оптимизатор и scheduler новые', flush=True)
+            print(f'init-weights: {args.init_weights} (epoch {init.get("epoch")}), оптимизатор и scheduler новые; '
+                  f'новых параметров (нет в чекпоинте): {len(new_param_names)} → lr × {args.new_lr_mult}: {sorted(new_param_names)[:6]}', flush=True)
     cls_criterion = nn.BCEWithLogitsLoss()
+    patch_criterion = nn.BCEWithLogitsLoss()
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     # find_unused_parameters: у timm-efficientnet часть параметров не попадает в граф (DDP падал с
     # «did not receive grad», indices 413–415); небольшой оверхед, зато работает для любого энкодера
     ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True) if world > 1 else model
     criterion = make_loss(args.loss)
-    optimizer = torch.optim.Adam(ddp_model.parameters(), lr=args.lr)
+    if new_param_names and args.new_lr_mult != 1.0:
+        base = [p for n, p in model.named_parameters() if n not in new_param_names]
+        new = [p for n, p in model.named_parameters() if n in new_param_names]
+        optimizer = torch.optim.Adam([{'params': base, 'lr': args.lr}, {'params': new, 'lr': args.lr * args.new_lr_mult}])
+    else:
+        optimizer = torch.optim.Adam(ddp_model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs) if args.scheduler == 'cosine' else None
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
@@ -481,12 +519,14 @@ def main():
                 x = x.to(memory_format=torch.channels_last)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast('cuda', enabled=args.amp):
-                logits, img_logit = forward(ddp_model, x)
+                logits, img_logit, patch_logit = forward(ddp_model, x)
             loss = criterion(logits.float(), y)
             if args.edge_weight > 0:
                 loss = loss + args.edge_weight * edge_loss(logits.float(), y)
             if img_logit is not None:
                 loss = loss + args.cls_weight * cls_criterion(img_logit.float(), batch['label'].to(device))
+            if patch_logit is not None:
+                loss = loss + args.patch_weight * patch_criterion(patch_logit.float(), patch_targets(y, patch_logit.shape[-2:]))
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             gn = torch.nn.utils.clip_grad_norm_(params, max_norm=1e9).item()   # только измеряем, не режем
@@ -506,7 +546,8 @@ def main():
         t_train = time.time() - t0
 
         if main_proc:
-            va_loss, pm, panel = validate(model, dl_val, criterion, device, df_val, args.amp, img_idx)
+            va_loss, pm, panel = validate(model, dl_val, criterion, device, df_val, args.amp, img_idx,
+                                          patch_gamma=args.patch_gamma if args.patch_head else 0.0)
             fm = None
             if args.full_every and not args.val_limit and (epoch % args.full_every == 0 or epoch == args.epochs):
                 fm = full_metric(model, df_proxy, args, device, run_dir, epoch)
@@ -518,6 +559,7 @@ def main():
             print(f'ep{epoch} train={tr_loss:.4f} val={va_loss:.4f} | proxy dice={pm["dice_pos"]:.4f} '
                   f'fpr={pm["fpr_main"]:.4f} aic={pm["aic"]:.4f}'
                   + (f' (ungated {pm["aic_ungated"]:.4f}; cls acc={pm["cls"]["acc"]:.3f} tpr={pm["cls"]["tpr"]:.3f} tnr={pm["cls"]["tnr"]:.3f})' if 'cls' in pm else '')
+                  + (f' [без patch-головы aic={pm["nopatch"]["aic"]:.4f} dice={pm["nopatch"]["dice_pos"]:.4f}]' if 'nopatch' in pm else '')
                   + (f' | full dice={fm["dice_pos"]:.4f} fpr={fm["fpr_main"]:.4f} aic={fm["aic"]:.4f}' if fm else '')
                   + f' | lr={lr_now:.2e} gn={rec["grad_norm"]:.2f} mem={rec["gpu_max_mem_gb"]}G | {rec["time_s"]}s (train {rec["train_time_s"]}s)', flush=True)
 
@@ -528,7 +570,8 @@ def main():
             if fm and fm['aic'] > best['full']:
                 best['full'] = fm['aic']; best_epoch['full'] = epoch
             weights = dict(epoch=epoch, model=model.state_dict(), encoder=args.encoder, img_size=list(args.img_size), aux_head=args.aux_head,
-                           decoder_channels=list(args.decoder_channels) if args.decoder_channels else None, metrics=rec)
+                           decoder_channels=list(args.decoder_channels) if args.decoder_channels else None, metrics=rec,
+                           extra_input=args.extra_input, patch_head=args.patch_head, patch_gamma=args.patch_gamma if args.patch_head else 0.0)
             for crit in ('loss', 'proxy', 'full'):
                 if best_epoch[crit] == epoch:
                     torch.save(weights, run_dir / f'best_{crit}.pth')
@@ -552,6 +595,8 @@ def main():
                 if 'cls' in pm:
                     d.update({'proxy/aic_ungated': pm['aic_ungated'], 'proxy/dice_pos_ungated': pm['dice_pos_ungated'],
                               'proxy/fpr_main_ungated': pm['fpr_main_ungated'], 'cls/acc': pm['cls']['acc'], 'cls/tpr': pm['cls']['tpr'], 'cls/tnr': pm['cls']['tnr']})
+                if 'nopatch' in pm:
+                    d.update({'proxy/aic_nopatch': pm['nopatch']['aic'], 'proxy/dice_pos_nopatch': pm['nopatch']['dice_pos'], 'proxy/fpr_main_nopatch': pm['nopatch']['fpr_main']})
                 if fm:
                     d.update({'full/dice_pos': fm['dice_pos'], 'full/fpr_main': fm['fpr_main'], 'full/aic': fm['aic']})
                     d.update({f'full/fpr_{k}': v for k, v in fm['fpr'].items()})

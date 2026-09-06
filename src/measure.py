@@ -22,11 +22,11 @@ from torch.utils.flop_counter import FlopCounterMode
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-def measure(model, img_size, iters: int, device) -> dict:
+def measure(model, img_size, iters: int, device, in_ch: int = 3) -> dict:
     from common import parse_size
     w, h = parse_size(img_size)
     model.eval()
-    x = torch.randn(1, 3, h, w, device=device)
+    x = torch.randn(1, in_ch, h, w, device=device)
     with torch.no_grad():
         fc = FlopCounterMode(display=False)
         with fc:
@@ -53,15 +53,18 @@ def main():
     ap.add_argument('--out')
     args = ap.parse_args()
     device = torch.device('cuda')
+    in_ch = 3
     if args.checkpoint:
+        from forensic import EXTRA_CHANNELS
         from predict import load_model
         model, ck = load_model(args.checkpoint, device)
         size = args.img_size or ck['img_size']
+        in_ch = 3 + EXTRA_CHANNELS[ck.get('extra_input', 'none')]   # препроцессинг доп. каналов (cv2) в FLOPs не входит, он ≈ 0.05 GFLOPs
     else:
         from train import build_model, parse_decoder
         model = build_model(args.encoder, weights=None, aux_head=True, decoder_channels=parse_decoder(args.decoder_channels)).to(device)
         size = args.img_size or 256
-    res = measure(model, size, args.iters, device)
+    res = measure(model, size, args.iters, device, in_ch=in_ch)
     print(f'{res["device"]}: img_size={size}  GFLOPs={res["gflops"]:.2f} (limit 100)  latency={res["latency_ms"]:.2f} ms (limit 50, H100 быстрее A4000 ~×3)')
     if args.out:
         Path(args.out).write_text(json.dumps(res, indent=1))

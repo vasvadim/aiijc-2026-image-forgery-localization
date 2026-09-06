@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import Dataset
 
 from common import data_dir, load_gt, load_rgb, normalize, parse_size
+from forensic import extra_channels
 
 cv2.setNumThreads(0)
 
@@ -115,8 +116,9 @@ class SegDataset(Dataset):
     Для строк без gt_path (neg_src / neg_nb / тест) маска нулевая."""
 
     def __init__(self, df, img_size, train: bool, root=None, path_col: str = 'chng_img_path', aug: str | None = None,
-                 mask_mix: float = 0.0):
+                 mask_mix: float = 0.0, extra_input: str = 'none'):
         self.df = df.reset_index(drop=True)
+        self.extra_input = extra_input   # доп. входные каналы (forensic.extra_channels), считаются после ресайза/flip
         self.img_size = parse_size(img_size)   # (w, h)
         self.train = train
         self.root = root or data_dir()
@@ -171,8 +173,11 @@ class SegDataset(Dataset):
             img = np.ascontiguousarray(img[:, ::-1])
             m = np.ascontiguousarray(m[:, ::-1])
         is_neg = int(r.get('is_neg', 1 if not gt_path else 0))
+        x = normalize(img)
+        if self.extra_input != 'none':
+            x = np.concatenate([x, extra_channels(img, self.extra_input)], axis=0)
         return {
-            'image': torch.from_numpy(normalize(img)),
+            'image': torch.from_numpy(x),
             'mask': torch.from_numpy(m.astype(np.float32)).unsqueeze(0),
             'label': torch.tensor([0.0 if is_neg else 1.0]),   # image-level: есть ли манипуляция
             'idx': idx,
