@@ -28,6 +28,17 @@ CUDA_VISIBLE_DEVICES=6 python src/train.py --run-name 20260902_baseline_r34_256 
 Пресеты в `data.AUG_PRESETS`.
 Мотивация и замеры — RESEARCH.md §3.5 (пункт 1 плана). Аугментации применяются и к негативам.
 
+**DINO-энкодер** — `--encoder dino:<timm-имя>` (например `dino:vit_small_patch16_dinov3.lvd1689m`), модель в
+`src/dino_seg.py`: ViT + лёгкий FPN-декодер до 1/4 + image-level голова. Веса DINOv3 качаются с HF
+через timm (на кластере работает). FLOPs с декодером: 704² — 91.8, 736² — 100.3 (не влезает).
+`--decoder-channels` игнорируется. Рекомендуемый lr для ViT ниже, чем у EfficientNet: 3e-5…5e-5.
+
+**Edge-loss** — `--edge-weight W`: к BCE+Dice добавляется W·BCE на полосе ~5 px вокруг контура GT
+(dilate−erode), мотивация — разбор ошибок (половина дефицита Dice на границах). 0 — выключено.
+
+**Тёплый старт** — `--init-weights <best_proxy.pth>`: только веса модели, оптимизатор/scheduler новые
+(в отличие от `--resume`, который восстанавливает всё состояние). Для дообучения с другим лоссом/lr.
+
 **Несколько GPU (DDP)** — тот же скрипт через `torchrun`; `--batch-size` задаётся на каждую карту,
 lr автоматически не масштабируется (эффективный батч = batch × число карт):
 

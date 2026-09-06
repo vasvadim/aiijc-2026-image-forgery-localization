@@ -38,6 +38,7 @@ import segmentation_models_pytorch as smp
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
@@ -86,6 +87,9 @@ def all_reduce_mean(x: float, device) -> float:
 def build_model(encoder: str, weights: str | None = 'imagenet', aux_head: bool = False, decoder_channels=None) -> nn.Module:
     """UNet; с aux_head=True возвращает (mask_logits, img_logit) — image-level голова «есть ли правка».
     decoder_channels — ширина UNet-декодера, по умолчанию smp (256,128,64,32,16); узкий (128,64,32,16,8) вдвое дешевле по FLOPs."""
+    if encoder.startswith('dino:'):
+        from dino_seg import DinoSeg
+        return DinoSeg(encoder[5:], pretrained=weights is not None, aux_head=aux_head)
     aux = dict(classes=1, pooling='avg', dropout=0.2) if aux_head else None
     kw = dict(decoder_channels=tuple(decoder_channels)) if decoder_channels else {}
     return smp.Unet(encoder_name=encoder, encoder_weights=weights, in_channels=3, classes=1, activation=None, aux_params=aux, **kw)
@@ -116,6 +120,18 @@ class BceDiceLoss(nn.Module):
         inter = (p * target).sum(dim=(1, 2, 3))
         dice = 1 - (2 * inter + 1) / (p.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) + 1)
         return bce + self.w * dice.mean()
+
+
+def edge_loss(logits, target, k: int = 5):
+    """BCE только на полосе шириной ~k px вокруг контура GT (dilate − erode). RESEARCH/разбор ошибок:
+    половина дефицита Dice — границы масок; BCE+Dice границы отдельно не штрафуют."""
+    with torch.no_grad():
+        dil = F.max_pool2d(target, k, stride=1, padding=k // 2)
+        ero = -F.max_pool2d(-target, k, stride=1, padding=k // 2)
+        band = (dil - ero) > 0
+    if not band.any():
+        return logits.sum() * 0
+    return F.binary_cross_entropy_with_logits(logits[band], target[band])
 
 
 def make_loss(name: str) -> nn.Module:
@@ -312,6 +328,8 @@ def main():
     ap.add_argument('--batch-size', type=int, default=32, help='на одну GPU')
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--loss', default='bce', choices=['bce', 'bce_dice'])
+    ap.add_argument('--edge-weight', type=float, default=0.0, help='вес BCE на полосе вокруг контура GT (0 — выключено)')
+    ap.add_argument('--init-weights', default=None, help='тёплый старт: загрузить только веса модели из чекпоинта (best_proxy.pth), оптимизатор/scheduler новые')
     ap.add_argument('--aux-head', action='store_true', help='image-level голова «есть ли правка» (smp aux_params), гейтинг при инференсе')
     ap.add_argument('--cls-weight', type=float, default=0.5, help='вес BCE image-level головы в общем loss')
     ap.add_argument('--aug', default='none', choices=['none', 'v1', 'v2'], help='аугментации робастности (data.AUG_PRESETS): v1 = rescale/JPEG q60–100/blur/noise (агрессивный), v2 = мягче, под распределение теста (JPEG q75–100, p 0.3)')
@@ -396,7 +414,12 @@ def main():
         dl_val = DataLoader(SegDataset(df_val, args.img_size, train=False), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
 
-    model = build_model(args.encoder, weights=None if ckpt else 'imagenet', aux_head=args.aux_head, decoder_channels=args.decoder_channels).to(device)
+    model = build_model(args.encoder, weights=None if (ckpt or args.init_weights) else 'imagenet', aux_head=args.aux_head, decoder_channels=args.decoder_channels).to(device)
+    if args.init_weights and not ckpt:
+        init = torch.load(args.init_weights, map_location='cpu', weights_only=False)
+        model.load_state_dict(init['model'])
+        if main_proc:
+            print(f'init-weights: {args.init_weights} (epoch {init.get("epoch")}), оптимизатор и scheduler новые', flush=True)
     cls_criterion = nn.BCEWithLogitsLoss()
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -459,6 +482,8 @@ def main():
             with torch.autocast('cuda', enabled=args.amp):
                 logits, img_logit = forward(ddp_model, x)
             loss = criterion(logits.float(), y)
+            if args.edge_weight > 0:
+                loss = loss + args.edge_weight * edge_loss(logits.float(), y)
             if img_logit is not None:
                 loss = loss + args.cls_weight * cls_criterion(img_logit.float(), batch['label'].to(device))
             scaler.scale(loss).backward()
