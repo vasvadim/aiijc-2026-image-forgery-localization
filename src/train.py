@@ -328,6 +328,7 @@ def main():
     ap.add_argument('--batch-size', type=int, default=32, help='на одну GPU')
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--loss', default='bce', choices=['bce', 'bce_dice'])
+    ap.add_argument('--mask-mix', type=float, default=0.0, help='mask-mixing по парам src/chng: вероятность на строку с оригиналом (0 — выключено); маски произвольной формы, площади — эмпирика ids9')
     ap.add_argument('--edge-weight', type=float, default=0.0, help='вес BCE на полосе вокруг контура GT (0 — выключено)')
     ap.add_argument('--init-weights', default=None, help='тёплый старт: загрузить только веса модели из чекпоинта (best_proxy.pth), оптимизатор/scheduler новые')
     ap.add_argument('--aux-head', action='store_true', help='image-level голова «есть ли правка» (smp aux_params), гейтинг при инференсе')
@@ -405,7 +406,7 @@ def main():
     if main_proc:
         print(f'train={len(df_train)} val-tune={len(df_val)} proxy={len(df_proxy)} world={world} run_dir={run_dir}', flush=True)
 
-    ds_train = SegDataset(df_train, args.img_size, train=True, aug=args.aug)
+    ds_train = SegDataset(df_train, args.img_size, train=True, aug=args.aug, mask_mix=args.mask_mix)
     sampler = DistributedSampler(ds_train, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler,
                           num_workers=args.workers, pin_memory=True, drop_last=True, persistent_workers=args.workers > 0)
