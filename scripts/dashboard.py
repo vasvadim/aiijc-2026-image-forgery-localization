@@ -18,11 +18,34 @@ from datetime import datetime
 from pathlib import Path
 
 
+def load_steps(d: Path, max_pts: int = 400) -> list:
+    """steps.jsonl → [[global_step, loss_ema, grad_norm, lr, epoch], ...], сглаженный loss (EMA 0.05), ≤ max_pts точек.
+    Нужен для ранов, у которых ещё нет завершённых эпох (длинные эпохи, учитель ViT-L), и для тренда внутри эпохи."""
+    f = d / 'steps.jsonl'
+    if not f.exists():
+        return []
+    rows = []
+    for l in f.read_text(encoding='utf-8').splitlines():
+        if l.strip():
+            try:
+                rows.append(json.loads(l))
+            except json.JSONDecodeError:
+                continue
+    if not rows:
+        return []
+    ema, out = None, []
+    for r in rows:
+        ema = r['loss'] if ema is None else 0.95 * ema + 0.05 * r['loss']
+        out.append([r.get('global_step'), round(ema, 4), r.get('grad_norm'), r.get('lr'), r.get('epoch')])
+    k = max(1, len(out) // max_pts)
+    return out[::k] + ([out[-1]] if (len(out) - 1) % k else [])
+
+
 def load(d: Path) -> dict:
-    ep = [json.loads(l) for l in (d / 'log.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()]
+    ep = [json.loads(l) for l in (d / 'log.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()] if (d / 'log.jsonl').exists() else []
     cfg = json.loads((d / 'config.json').read_text(encoding='utf-8')) if (d / 'config.json').exists() else {}
     thr = json.loads((d / 'threshold.json').read_text(encoding='utf-8')) if (d / 'threshold.json').exists() else None
-    return dict(name=d.name, epochs=ep, config=cfg, threshold=thr, bestfile=(d / 'best.json').exists())
+    return dict(name=d.name, epochs=ep, steps=load_steps(d), config=cfg, threshold=thr, bestfile=(d / 'best.json').exists())
 
 
 TEMPLATE = r"""<title>__TITLE__</title>
@@ -92,18 +115,22 @@ tr.best td{font-weight:600;color:var(--accent)}
 <script id="data" type="application/json">__DATA__</script>
 <script>
 const DATA = JSON.parse(document.getElementById('data').textContent);
-const RUNS = DATA.runs.filter(r => r.epochs.length);
+const RUNS = DATA.runs.filter(r => r.epochs.length || (r.steps && r.steps.length));
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const f4 = x => (x==null||Number.isNaN(x)) ? '—' : (+x).toFixed(4);
 const f3 = x => (x==null||Number.isNaN(x)) ? '—' : (+x).toFixed(3);
 const get = (r, path) => path.split('.').reduce((o,k)=> (o==null?undefined:o[k]), r);
 const short = n => n.replace(/^vad_/,'').replace(/^\d{8}_/,'');
+const kfmt = x => x>=1000 ? (x/1000).toFixed(x>=10000?0:1)+'k' : String(x);
 document.getElementById('title').textContent = DATA.title;
-if (!RUNS.length) { document.getElementById('subtitle').textContent = 'ни у одного рана нет завершённых эпох — обновлено ' + DATA.generated; throw new Error('no epochs'); }
+if (!RUNS.length) { document.getElementById('subtitle').textContent = 'ни у одного рана нет ни эпох, ни шагов — обновлено ' + DATA.generated; throw new Error('no data'); }
 const S1=css('--s1'), S2=css('--s2'), S3=css('--s3'), S4=css('--s4'), S5=css('--s5'), S6=css('--s6'), S7=css('--s7');
 const RUNCOL = [S1,S2,S4,S7,S5,S6,S3];
-RUNS.forEach((r,i)=>{ r.color = RUNCOL[i % RUNCOL.length]; r.best = r.epochs.reduce((a,b)=> b.proxy.aic>a.proxy.aic?b:a, r.epochs[0]); r.last = r.epochs[r.epochs.length-1]; });
+RUNS.forEach((r,i)=>{ r.color = RUNCOL[i % RUNCOL.length]; r.steps = r.steps || [];
+  r.best = r.epochs.length ? r.epochs.reduce((a,b)=> b.proxy.aic>a.proxy.aic?b:a, r.epochs[0]) : null; r.last = r.epochs.length ? r.epochs[r.epochs.length-1] : null; });
+const EPRUNS = RUNS.filter(r=>r.epochs.length);
 const pts = (arr, fn) => arr.map(r=>[r.epoch, fn(r)]);
+const spts = (steps, i) => steps.map(s=>[s[0], s[i]]);
 
 // ---- generic line chart
 function chart(el, title, note, series, opts={}) {
@@ -111,16 +138,17 @@ function chart(el, title, note, series, opts={}) {
   const all = series.flatMap(s=>s.pts).filter(p=>p[1]!=null && !Number.isNaN(p[1]));
   if (!all.length) { el.innerHTML = `<h3>${title}</h3><div class="note">нет данных</div>`; return; }
   const xs = all.map(p=>p[0]), ys = all.map(p=>p[1]);
-  const xmin = 1, xmax = Math.max(2, ...xs);
+  const xmin = opts.xmin ?? 1, xmax = Math.max(xmin+1, ...xs);
+  const xfmt = opts.xfmt || (x=>String(x)), xname = opts.xname || 'эпоха';
   let ymin = opts.ymin ?? Math.min(...ys), ymax = opts.ymax ?? Math.max(...ys);
   if (opts.ymin==null||opts.ymax==null){ const pad=(ymax-ymin||0.1)*0.08; if(opts.ymin==null) ymin-=pad; if(opts.ymax==null) ymax+=pad; }
   const X = x => pl + (x-xmin)/(xmax-xmin||1)*(W-pl-pr);
   const Y = y => pt + (1-(y-ymin)/(ymax-ymin||1))*(H-pt-pb);
   const ticksY = 4, ty = Array.from({length:ticksY+1},(_,i)=>ymin+(ymax-ymin)*i/ticksY);
-  const txStep = xmax>12 ? Math.ceil(xmax/10) : 1;
+  const txStep = opts.xstep || (xmax>12 ? Math.ceil(xmax/10) : 1);
   let g = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${title}">`;
   ty.forEach(v=>{ g+=`<line x1="${pl}" x2="${W-pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--grid)" stroke-width="1"/><text x="${pl-6}" y="${Y(v)+4}" text-anchor="end" font-size="10" fill="var(--ink-3)" font-family="IBM Plex Mono,monospace">${v.toFixed(opts.dec??2)}</text>`; });
-  for (let x=xmin;x<=xmax;x+=txStep) g+=`<text x="${X(x)}" y="${H-8}" text-anchor="middle" font-size="10" fill="var(--ink-3)" font-family="IBM Plex Mono,monospace">${x}</text>`;
+  for (let x=xmin;x<=xmax;x+=txStep) g+=`<text x="${X(x)}" y="${H-8}" text-anchor="middle" font-size="10" fill="var(--ink-3)" font-family="IBM Plex Mono,monospace">${xfmt(x)}</text>`;
   g+=`<line x1="${pl}" x2="${W-pr}" y1="${H-pb}" y2="${H-pb}" stroke="var(--line)"/>`;
   if (opts.hline!=null && opts.hline>=ymin && opts.hline<=ymax) g+=`<line x1="${pl}" x2="${W-pr}" y1="${Y(opts.hline)}" y2="${Y(opts.hline)}" stroke="var(--ink-3)" stroke-dasharray="2 4"/><text x="${W-pr}" y="${Y(opts.hline)-4}" text-anchor="end" font-size="10" fill="var(--ink-3)">${opts.hlabel||''}</text>`;
   series.forEach(s=>{ const p=s.pts.filter(q=>q[1]!=null&&!Number.isNaN(q[1])); if(!p.length) return;
@@ -133,9 +161,11 @@ function chart(el, title, note, series, opts={}) {
   const legend = series.length>1 ? `<div class="legend">${series.map(s=>`<span><i class="${s.dash?'dash':''}" style="border-color:${s.color}"></i>${s.bold?'<b>'+s.name+'</b>':s.name}</span>`).join('')}</div>` : '';
   el.innerHTML = `<h3>${title}</h3><div class="note">${note||''}</div>${g}${legend}<div class="tip"></div>`;
   const svg = el.querySelector('svg'), tip = el.querySelector('.tip'), cross = el.querySelector('.cross');
-  svg.addEventListener('mousemove', ev=>{ const r=svg.getBoundingClientRect(); const x = (ev.clientX-r.left)/r.width*W; const ep = Math.round(xmin+(x-pl)/(W-pl-pr)*(xmax-xmin)); if(ep<xmin||ep>xmax){tip.style.display='none';cross.style.display='none';return;}
+  const nearest = (p, x) => { let b=null, bd=Infinity; for (const q of p) { const d=Math.abs(q[0]-x); if (d<bd) { bd=d; b=q; } } return b; };
+  svg.addEventListener('mousemove', ev=>{ const r=svg.getBoundingClientRect(); const x = (ev.clientX-r.left)/r.width*W; const xv = xmin+(x-pl)/(W-pl-pr)*(xmax-xmin); if(xv<xmin||xv>xmax){tip.style.display='none';cross.style.display='none';return;}
+    const ep = opts.xstep ? xv : Math.round(xv);
     cross.setAttribute('x1',X(ep)); cross.setAttribute('x2',X(ep)); cross.style.display='';
-    tip.innerHTML = `<b>эпоха ${ep}</b><br>` + series.map(s=>{const q=s.pts.find(p=>p[0]===ep); return q&&q[1]!=null?`${s.name}: ${(+q[1]).toFixed(4)}`:null;}).filter(Boolean).join('<br>');
+    tip.innerHTML = `<b>${xname} ${xfmt(Math.round(ep))}</b><br>` + series.map(s=>{const q = opts.xstep ? nearest(s.pts.filter(p=>p[1]!=null), ep) : s.pts.find(p=>p[0]===ep); return q&&q[1]!=null?`${s.name}: ${(+q[1]).toFixed(4)}`:null;}).filter(Boolean).join('<br>');
     tip.style.display='block'; const cr=el.getBoundingClientRect(); tip.style.left=Math.min(ev.clientX-cr.left+12, cr.width-tip.offsetWidth-8)+'px'; tip.style.top=(ev.clientY-cr.top-10)+'px'; });
   svg.addEventListener('mouseleave', ()=>{tip.style.display='none';cross.style.display='none';});
 }
@@ -143,7 +173,7 @@ const addTo = (holder, title, note, series, opts) => { const d=document.createEl
 
 // ---- run selector
 const sel = document.getElementById('runsel');
-RUNS.forEach((r,i)=>{ const o=document.createElement('option'); o.value=i; o.textContent=`${short(r.name)} · ${r.epochs.length} эп. · best ${f4(r.best.proxy.aic)}`; sel.appendChild(o); });
+RUNS.forEach((r,i)=>{ const o=document.createElement('option'); o.value=i; o.textContent = r.best ? `${short(r.name)} · ${r.epochs.length} эп. · best ${f4(r.best.proxy.aic)}` : `${short(r.name)} · 0 эп. · ${kfmt(r.steps[r.steps.length-1][0])} шагов`; sel.appendChild(o); });
 let selIdx = 0;
 try { const saved = localStorage.getItem('aic_dash_run'); const j = RUNS.findIndex(r=>r.name===saved); if (j>=0) selIdx=j; } catch(e) {}
 sel.value = selIdx;
@@ -152,12 +182,15 @@ sel.addEventListener('change', ()=>{ selIdx = +sel.value; try { localStorage.set
 // ---- comparison charts (all runs, selected bold)
 function renderCmp() {
   const holder = document.getElementById('charts_cmp'); holder.innerHTML = '';
-  const runSeries = fn => RUNS.map((r,i)=>({name:short(r.name), color:r.color, bold:i===selIdx, faint:i!==selIdx, pts:pts(r.epochs, fn), best: i===selIdx ? r.best.epoch : null}));
+  const runSeries = fn => EPRUNS.map(r=>({name:short(r.name), color:r.color, bold:r===RUNS[selIdx], faint:r!==RUNS[selIdx], pts:pts(r.epochs, fn), best: r===RUNS[selIdx] ? r.best.epoch : null}));
+  const stepRuns = RUNS.filter(r=>r.steps.length);
+  if (stepRuns.length) { const xmax = Math.max(...stepRuns.map(r=>r.steps[r.steps.length-1][0]));
+    addTo(holder, 'Train loss по шагам', 'сглаженный (EMA 0.05) loss из steps.jsonl; виден и у ранов без завершённых эпох', stepRuns.map(r=>({name:short(r.name), color:r.color, bold:r===RUNS[selIdx], faint:r!==RUNS[selIdx], pts:spts(r.steps,1)})), {ymin:0, dec:2, xmin:0, xstep:Math.max(1,Math.ceil(xmax/8/1000)*1000), xfmt:kfmt, xname:'шаг'}); }
   addTo(holder, 'Proxy AIC', 'Dice per image + FPR_main на proxy-подмножестве, t = 0.5; у ранов с головой — с гейтингом τ = 0.5; кольцо — лучшая эпоха выбранного', runSeries(r=>r.proxy.aic), {dec:3});
   addTo(holder, 'Dice_pos', 'среднее по позитивам proxy', runSeries(r=>r.proxy.dice_pos), {dec:3});
   addTo(holder, 'FPR_main', 'среднее FPR по пулам neg_train и neg_src при t = 0.5 (с гейтингом, если есть голова)', runSeries(r=>r.proxy.fpr_main), {ymin:0, dec:2});
   addTo(holder, 'val loss', 'сравнимо только при одинаковом loss и одинаковом наборе негативов', runSeries(r=>r.val_loss), {dec:3});
-  if (RUNS.some(r=>r.epochs.some(e=>e.proxy.dice_by_area))) {
+  if (EPRUNS.some(r=>r.epochs.some(e=>e.proxy.dice_by_area))) {
     addTo(holder, 'Dice на мелких масках (< 1 % кадра)', 'самый чувствительный к разрешению разрез', runSeries(r=>get(r,'proxy.dice_by_area.lt1')), {ymin:0, ymax:1, dec:2});
     addTo(holder, 'Dice на масках 1–5 % кадра', '', runSeries(r=>get(r,'proxy.dice_by_area.1-5')), {ymin:0, ymax:1, dec:2});
   }
@@ -169,7 +202,21 @@ function renderRun() {
   document.getElementById('runname').textContent = M.name;
   const st = document.getElementById('status'); st.textContent = M.bestfile ? 'завершён' : 'обучается'; st.className = 'pill ' + (M.bestfile?'done':'run');
   const sz = Array.isArray(c.img_size) ? c.img_size.join('×') : (c.img_size + '²');
-  document.getElementById('subtitle').textContent = `${c.encoder||''} · ${sz} · декодер ${c.decoder_channels ? c.decoder_channels.join(',') : 'smp'} · ${c.loss} · lr ${c.lr}${c.scheduler&&c.scheduler!=='none'?' '+c.scheduler:''} · batch ${c.batch_size}×${c.world_size||1} GPU · aux ${c.aux_head?'да':'нет'} · neg-src ${c.neg_src??0} · patience ${c.patience??'—'} · валидация ${c.version||'v1'}`;
+  document.getElementById('subtitle').textContent = `${c.encoder||''} · ${sz}${c.native?' · нативный режим'+(c.crop_schedule?' '+c.crop_schedule:''):''} · декодер ${c.decoder_channels ? c.decoder_channels.join(',') : 'smp'} · ${c.loss} · lr ${c.lr}${c.scheduler&&c.scheduler!=='none'?' '+c.scheduler:''} · batch ${c.batch_size}×${c.world_size||1} GPU · aux ${c.aux_head?'да':'нет'} · neg-src ${c.neg_src??0} · patience ${c.patience??'—'} · валидация ${c.version||'v1'}`;
+  const holder = document.getElementById('charts_run'); holder.innerHTML = '';
+  const col = M.color;
+  const stepChart = () => { if (!M.steps.length) return; const xmax = M.steps[M.steps.length-1][0];
+    addTo(holder, 'Train loss по шагам (сглажено)', 'EMA 0.05 из steps.jsonl; всплески — шум батча, тренд важнее', [{name:'loss', color:col, pts:spts(M.steps,1)}], {ymin:0, dec:2, xmin:0, xstep:Math.max(1,Math.ceil(xmax/8/1000)*1000), xfmt:kfmt, xname:'шаг'});
+    addTo(holder, 'Норма градиента по шагам', 'L2-норма градиента на шаге (сырая); lr — пунктиром (×1e4)', [{name:'grad norm', color:col, pts:spts(M.steps,2)}, {name:'lr ×1e4', color:S4, dash:true, pts:M.steps.map(s=>[s[0], s[3]!=null?s[3]*1e4:null])}], {ymin:0, dec:2, xmin:0, xstep:Math.max(1,Math.ceil(xmax/8/1000)*1000), xfmt:kfmt, xname:'шаг'}); };
+  if (!E.length) {   // ран без завершённых эпох: только шаги
+    const s = M.steps[M.steps.length-1];
+    document.getElementById('tiles').innerHTML = [['эпоха', `${s[4]??1} / ${c.epochs}`, 'ещё нет завершённых эпох'], ['шаг', kfmt(s[0]), 'global_step'], ['train loss (EMA)', f3(s[1]), 'сглаженный по шагам'], ['grad norm (посл.)', f3(s[2]), ''], ['lr', s[3]!=null?(+s[3]).toExponential(2):'—', '']]
+      .map(t=>`<div class="tile"><div class="k">${t[0]}</div><div class="v mono">${t[1]}</div><div class="d">${t[2]}</div></div>`).join('');
+    stepChart();
+    document.getElementById('tbl').innerHTML = '<tbody><tr><td>эпох ещё нет</td></tr></tbody>';
+    document.getElementById('foot').textContent = `Обновлено ${DATA.generated}. Источник: log.jsonl / steps.jsonl из ~/aic2026/runs/<user>/<run>/ на кластере.`;
+    return;
+  }
   const since = last.epoch - best.epoch;
   const tiles = [
     ['эпоха', `${last.epoch} / ${c.epochs}`, `${Math.round(last.time_s/60)} мин/эпоху`],
@@ -183,8 +230,6 @@ function renderRun() {
   if (M.threshold) tiles.push(['подбор порога', `${M.threshold.t} / ${M.threshold.a_min}` + (M.threshold.tau!=null?` / τ ${M.threshold.tau}`:''), `val-tune AIC ${f4(M.threshold.aic)}`]);
   document.getElementById('tiles').innerHTML = tiles.map(t=>`<div class="tile"><div class="k">${t[0]}</div><div class="v mono">${t[1]}</div><div class="d">${t[2]}</div></div>`).join('');
 
-  const holder = document.getElementById('charts_run'); holder.innerHTML = '';
-  const col = M.color;
   addTo(holder, 'Proxy AIC и full', 'сплошная — proxy на тензорах; пунктир — официальная метрика на PNG (t = 0.5)', [
     {name:'proxy', color:col, pts:pts(E,r=>r.proxy.aic), best:best.epoch}, {name:'full', color:col, dash:true, pts:pts(E,r=>r.full?r.full.aic:null)},
     ...(E.some(r=>r.proxy.aic_ungated!=null)?[{name:'ungated', color:S3, dash:true, pts:pts(E,r=>r.proxy.aic_ungated)}]:[])], {dec:3});
@@ -205,6 +250,7 @@ function renderRun() {
   if (E.some(r=>r.grad_norm!=null)) addTo(holder, 'Норма градиента и lr', 'средняя по эпохе L2-норма градиента; lr — пунктиром (×1e4)', [
     {name:'grad norm', color:col, pts:pts(E,r=>r.grad_norm)}, {name:'lr ×1e4', color:S4, dash:true, pts:pts(E,r=>r.lr!=null?r.lr*1e4:null)}], {dec:2});
   addTo(holder, 'Время эпохи, с', 'полный цикл: train + валидация + full-метрика', [{name:'сек', color:col, pts:pts(E,r=>r.time_s)}], {ymin:0, dec:0});
+  stepChart();
 
   const cols = [['эпоха',r=>r.epoch,0],['train',r=>r.train_loss,4],['val',r=>r.val_loss,4],['Dice',r=>r.proxy.dice_pos,4],['FPR train',r=>r.proxy.fpr.neg_train,3],['FPR src',r=>r.proxy.fpr.neg_src,3],['FPR main',r=>r.proxy.fpr_main,4],['proxy AIC',r=>r.proxy.aic,4],['ungated',r=>r.proxy.aic_ungated,4],['full AIC',r=>r.full?r.full.aic:null,4],['cls acc',r=>r.proxy.cls?r.proxy.cls.acc:null,3],['пустых',r=>r.proxy.empty_pred_on_pos,3],['grad',r=>r.grad_norm,2],['lr',r=>r.lr,6],['мем GB',r=>r.gpu_max_mem_gb,1],['с',r=>r.time_s,0]];
   document.getElementById('tbl').innerHTML = '<thead><tr>'+cols.map(c=>`<th>${c[0]}</th>`).join('')+'</tr></thead><tbody>'+E.map(r=>`<tr class="${r.epoch===best.epoch?'best':''}">`+cols.map(c=>{const v=c[1](r); return `<td class="mono">${v==null?'—':(+v).toFixed(c[2])}</td>`;}).join('')+'</tr>').join('')+'</tbody>';
@@ -225,7 +271,7 @@ def main():
     ap.add_argument('--title', default='Детектив: обучение')
     args = ap.parse_args()
     paths = ([args.main] if args.main else []) + args.run + args.ref
-    runs = [load(Path(p)) for p in paths if (Path(p) / 'log.jsonl').exists()]
+    runs = [load(Path(p)) for p in paths if (Path(p) / 'log.jsonl').exists() or (Path(p) / 'steps.jsonl').exists()]
     data = dict(runs=runs, title=args.title, generated=datetime.now().strftime('%Y-%m-%d %H:%M'))
     html = TEMPLATE.replace('__TITLE__', args.title).replace('__DATA__', json.dumps(data, ensure_ascii=False).replace('</', '<\\/'))
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
