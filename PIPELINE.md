@@ -40,6 +40,15 @@ CUDA_VISIBLE_DEVICES=6 python src/train.py --run-name 20260902_baseline_r34_256 
 внутри R, маска = GT \ R. Даёт маски произвольной формы и мелкие фрагменты (RESEARCH §3.4-E). Работает
 только на доменах с src (coco/raise/openimages). Примеры: reports/maskmix_examples.jpg.
 
+**Mask-mixing v2 (07.09)** — три доп. флага к `--mask-mix P`: `--mix-areas ids9|small|mix` (целевые площади
+crop-режима: эмпирика ids9 / лог-равномерно 0.3–5 % кадра / 60 % small + 40 % ids9), `--mix-feather F`
+(растушёвка края вставки, σ ~ U(0, F) px, чтобы сеть не училась на жёсткую границу склейки),
+`--mix-shapes box,ellipse,poly` (формы региона). Мотивация: RESEARCH §9 — дефицит Dice в масках 1–5 % кадра,
+v1 с площадями ids9 (медиана 10 %) мелкие маски не сдвинул. Примеры: `reports/maskmix_v2_examples.jpg`.
+Рекомендуемый запуск с контроля ep20:
+`--mask-mix 0.5 --mix-areas mix --mix-feather 4 --mix-shapes box,ellipse,poly --init-weights <best_proxy ep20> --lr 3e-5 --scheduler cosine --epochs 12 --patience 5`.
+Неизменённые маски остаются: микс применяется к 50 % строк с оригиналом, ids9 и негативы не трогаются.
+
 **Edge-loss** — `--edge-weight W`: к BCE+Dice добавляется W·BCE на полосе ~5 px вокруг контура GT
 (dilate−erode), мотивация — разбор ошибок (половина дефицита Dice на границах). 0 — выключено.
 
