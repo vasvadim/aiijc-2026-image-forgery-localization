@@ -453,6 +453,13 @@ def main():
         if main_proc:
             print(f'init-weights: {args.init_weights} (epoch {init.get("epoch")}), оптимизатор и scheduler новые; '
                   f'новых параметров (нет в чекпоинте): {len(new_param_names)} → lr × {args.new_lr_mult}: {sorted(new_param_names)[:6]}', flush=True)
+    if ckpt and args.init_weights and args.new_lr_mult != 1.0:
+        # resume рана с двумя группами параметров: восстановить состав «новых» параметров (их нет в init-чекпоинте),
+        # иначе optimizer.load_state_dict упадёт на несовпадении числа групп
+        init_keys = set(adapt_state_dict(dict.fromkeys(torch.load(args.init_weights, map_location='cpu', weights_only=False)['model'].keys()), model).keys())
+        new_param_names = {n for n, _ in model.named_parameters() if n not in init_keys}
+        if main_proc:
+            print(f'resume: группы параметров восстановлены, новых {len(new_param_names)} → lr × {args.new_lr_mult}', flush=True)
     cls_criterion = nn.BCEWithLogitsLoss()
     patch_criterion = nn.BCEWithLogitsLoss()
     if args.channels_last:
