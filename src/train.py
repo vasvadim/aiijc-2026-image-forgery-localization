@@ -350,6 +350,9 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--loss', default='bce', choices=['bce', 'bce_dice'])
     ap.add_argument('--mask-mix', type=float, default=0.0, help='mask-mixing по парам src/chng: вероятность на строку с оригиналом (0 — выключено); маски произвольной формы, площади — эмпирика ids9')
+    ap.add_argument('--mix-areas', default='ids9', choices=['ids9', 'small', 'mix'], help='целевые площади crop-режима mask-mix: ids9 (эмпирика), small (0.3–5 %% кадра), mix (60 %% small + 40 %% ids9)')
+    ap.add_argument('--mix-feather', type=float, default=0.0, help='растушёвка края вставки mask-mix, σ ~ U(0, F) px (0 — жёсткая склейка)')
+    ap.add_argument('--mix-shapes', default='box,ellipse', help='формы региона mask-mix через запятую: box, ellipse, poly')
     ap.add_argument('--edge-weight', type=float, default=0.0, help='вес BCE на полосе вокруг контура GT (0 — выключено)')
     ap.add_argument('--init-weights', default=None, help='тёплый старт: загрузить только веса модели из чекпоинта (best_proxy.pth), оптимизатор/scheduler новые')
     ap.add_argument('--new-lr-mult', type=float, default=1.0, help='при --init-weights: параметры, которых нет в чекпоинте (новые модули), идут отдельной группой с lr × mult')
@@ -432,7 +435,8 @@ def main():
     if main_proc:
         print(f'train={len(df_train)} val-tune={len(df_val)} proxy={len(df_proxy)} world={world} run_dir={run_dir}', flush=True)
 
-    ds_train = SegDataset(df_train, args.img_size, train=True, aug=args.aug, mask_mix=args.mask_mix, extra_input=args.extra_input)
+    mix_cfg = dict(areas=args.mix_areas, feather=args.mix_feather, shapes=tuple(s for s in args.mix_shapes.split(',') if s))
+    ds_train = SegDataset(df_train, args.img_size, train=True, aug=args.aug, mask_mix=args.mask_mix, extra_input=args.extra_input, mix_cfg=mix_cfg)
     sampler = DistributedSampler(ds_train, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True) if world > 1 else None
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler,
                           num_workers=args.workers, pin_memory=True, drop_last=True, persistent_workers=args.workers > 0)

@@ -52,14 +52,26 @@ def augment_postprocess(img: np.ndarray, rng: np.random.Generator, cfg: dict) ->
     return np.ascontiguousarray(img)
 
 
-def _region(h, w, cy, cx, hw, hh, ellipse, rng):
-    """Булева маска региона R: прямоугольник или эллипс с центром (cy, cx) и полуразмерами (hh, hw)."""
+MIX_DEFAULT = dict(areas='ids9', feather=0.0, shapes=('box', 'ellipse'))
+# v2 (07.09, RESEARCH §9 / обсуждение): areas='small' — лог-равномерно 0.3–5 % кадра (дефицит Dice — маски 1–5 %),
+# 'mix' — 60 % small + 40 % эмпирика ids9; feather — растушёвка края вставки (σ ~ U(0, feather) px), как в
+# self-blended методах (SBI/PIDA), чтобы сеть не училась на жёсткую границу склейки; shapes — box/ellipse/poly.
+SMALL_AREA = (0.003, 0.05)
+
+
+def _region(h, w, cy, cx, hw, hh, shape, poly=None):
+    """Булева маска региона R с центром (cy, cx) и полуразмерами (hh, hw): 'box', 'ellipse' или 'poly'
+    (звёздчатый многоугольник, poly = (углы, радиусы 0.5–1) в единичных координатах)."""
+    R = np.zeros((h, w), bool)
+    if shape == 'poly':
+        pts = np.stack([cx + hw * poly[1] * np.cos(poly[0]), cy + hh * poly[1] * np.sin(poly[0])], 1)
+        cv2.fillPoly(R.view(np.uint8), [np.round(pts).astype(np.int32)], 1)
+        return R
     y0, y1 = max(0, int(cy - hh)), min(h, int(cy + hh) + 1)
     x0, x1 = max(0, int(cx - hw)), min(w, int(cx + hw) + 1)
-    R = np.zeros((h, w), bool)
     if y1 <= y0 or x1 <= x0:
         return R
-    if ellipse:
+    if shape == 'ellipse':
         yy, xx = np.ogrid[y0:y1, x0:x1]
         R[y0:y1, x0:x1] = ((yy - cy) / max(hh, 1)) ** 2 + ((xx - cx) / max(hw, 1)) ** 2 <= 1.0
     else:
@@ -67,11 +79,19 @@ def _region(h, w, cy, cx, hw, hh, ellipse, rng):
     return R
 
 
-def mask_mix(chng: np.ndarray, src: np.ndarray, gt: np.ndarray, rng, target_areas):
+def _sample_area(rng, target_areas, mode: str) -> float:
+    if mode == 'small' or (mode == 'mix' and rng.random() < 0.6):
+        return float(np.exp(rng.uniform(np.log(SMALL_AREA[0]), np.log(SMALL_AREA[1]))))
+    return float(rng.choice(target_areas))
+
+
+def mask_mix(chng: np.ndarray, src: np.ndarray, gt: np.ndarray, rng, target_areas, cfg: dict | None = None):
     """Новый позитив из выровненной пары (src, chng, GT): режим crop (p=0.7) — в src вставляем кусок chng
-    внутри региона R, маска = R ∩ GT, размер R подбирается под целевую площадь из target_areas (доли кадра,
-    эмпирическое распределение ids9); режим hole — в chng вставляем src внутри R, маска = GT \ R.
-    R — прямоугольник или эллипс с центром в случайной точке GT. Возвращает (img, mask) или None."""
+    внутри региона R, маска = R ∩ GT, размер R подбирается под целевую площадь (cfg['areas']: 'ids9' — эмпирика
+    target_areas, 'small' — 0.3–5 % кадра, 'mix' — 60/40); режим hole — в chng вставляем src внутри R, маска = GT \\ R.
+    R — box / ellipse / poly (cfg['shapes']) с центром в случайной точке GT; край вставки растушёван
+    (cfg['feather'] px). Возвращает (img, mask) или None."""
+    cfg = {**MIX_DEFAULT, **(cfg or {})}
     h, w = gt.shape
     ys, xs = np.nonzero(gt)
     if len(ys) < 64:
@@ -79,17 +99,22 @@ def mask_mix(chng: np.ndarray, src: np.ndarray, gt: np.ndarray, rng, target_area
     k = rng.integers(len(ys)); cy, cx = int(ys[k]), int(xs[k])
     y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
     bh, bw = max(8, (y1 - y0 + 1) / 2), max(8, (x1 - x0 + 1) / 2)
-    ellipse = rng.random() < 0.5
+    shape = cfg['shapes'][rng.integers(len(cfg['shapes']))]
+    poly = None
+    if shape == 'poly':
+        n = int(rng.integers(6, 13))
+        ang = np.sort(rng.uniform(0, 2 * np.pi, n)); rad = rng.uniform(0.5, 1.0, n)
+        poly = (ang, rad)
     gt_area = int(gt.sum())
     if rng.random() < 0.7:   # crop: подобрать масштаб R под целевую площадь (бисекция по scale)
-        target = float(rng.choice(target_areas)) * h * w
+        target = _sample_area(rng, target_areas, cfg['areas']) * h * w
         target = min(target, 0.9 * gt_area)
         if target < 0.002 * h * w:
             return None
         lo, hi, best = 0.02, 2.0, None
         for _ in range(8):
             s = (lo + hi) / 2
-            R = _region(h, w, cy, cx, s * bw, s * bh, ellipse, rng)
+            R = _region(h, w, cy, cx, s * bw, s * bh, shape, poly)
             a = int((R & gt).sum())
             best = (R, a)
             if a < target:
@@ -100,10 +125,15 @@ def mask_mix(chng: np.ndarray, src: np.ndarray, gt: np.ndarray, rng, target_area
         new_mask = R & gt
         if a < 0.002 * h * w or a > 0.95 * gt_area:
             return None
-        out = src.copy(); out[R] = chng[R]
+        sigma = float(rng.uniform(0, cfg['feather'])) if cfg['feather'] > 0 else 0.0
+        if sigma > 0.3:
+            alpha = cv2.GaussianBlur(R.astype(np.float32), (0, 0), sigma)[..., None]
+            out = np.clip(src.astype(np.float32) * (1 - alpha) + chng.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+        else:
+            out = src.copy(); out[R] = chng[R]
     else:                    # hole: вырезать из GT кусок, вернув туда оригинал
         s = rng.uniform(0.2, 0.6)
-        R = _region(h, w, cy, cx, s * bw, s * bh, ellipse, rng)
+        R = _region(h, w, cy, cx, s * bw, s * bh, shape, poly)
         new_mask = gt & ~R
         if new_mask.sum() < max(64, 0.05 * gt_area) or (gt & R).sum() < 0.05 * gt_area:
             return None
@@ -116,8 +146,9 @@ class SegDataset(Dataset):
     Для строк без gt_path (neg_src / neg_nb / тест) маска нулевая."""
 
     def __init__(self, df, img_size, train: bool, root=None, path_col: str = 'chng_img_path', aug: str | None = None,
-                 mask_mix: float = 0.0, extra_input: str = 'none'):
+                 mask_mix: float = 0.0, extra_input: str = 'none', mix_cfg: dict | None = None):
         self.df = df.reset_index(drop=True)
+        self.mix_cfg = {**MIX_DEFAULT, **(mix_cfg or {})}
         self.extra_input = extra_input   # доп. входные каналы (forensic.extra_channels), считаются после ресайза/flip
         self.img_size = parse_size(img_size)   # (w, h)
         self.train = train
@@ -155,7 +186,7 @@ class SegDataset(Dataset):
             src = load_rgb(self.root / src_path)
             if src.shape == img.shape:
                 gt_full = load_gt(self.root / gt_path)
-                mixed = mask_mix(img, src, gt_full, self._get_rng(), self.target_areas)
+                mixed = mask_mix(img, src, gt_full, self._get_rng(), self.target_areas, self.mix_cfg)
                 if mixed is not None:
                     img, m_full = mixed
                     self.mix_stats['done'] += 1
