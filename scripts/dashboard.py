@@ -33,6 +33,12 @@ def load_steps(d: Path, max_pts: int = 400) -> list:
                 continue
     if not rows:
         return []
+    # после --resume steps.jsonl дописывается с меньшего global_step: оставляем последний монотонный отрезок
+    cut = 0
+    for i in range(1, len(rows)):
+        if (rows[i].get('global_step') or 0) < (rows[i - 1].get('global_step') or 0):
+            cut = i
+    rows = rows[cut:]
     ema, out = None, []
     for r in rows:
         ema = r['loss'] if ema is None else 0.95 * ema + 0.05 * r['loss']
